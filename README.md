@@ -22,10 +22,21 @@ Pigeon separates **identity**, **routing**, **recent synchronization**, and **lo
 - A user's current server is mutable signed routing metadata.
 - Contacts cache the latest valid signed routing record they have seen for each identity.
 - Servers coordinate delivery, device synchronization, presence, signaling, and recent encrypted content.
-- Servers retain content for at most 14 days, or until it has been delivered to all currently authorized devices for the relevant identities, whichever happens first.
+- Servers retain content for at most 14 days, or until it has been delivered to all active authorized devices for the relevant identities, whichever happens first.
+- Devices inactive for more than 90 days become dormant and stop blocking server-side delivery completion, but remain cryptographically authorized until explicitly revoked by the user.
 - Devices retain long-term history according to local user-configurable retention policies.
 - Server changes are signed identity events and should automatically propagate to the user's other devices and contacts.
 - There is no global authoritative Pigeon identity directory.
+
+## Device States
+
+Each device associated with an identity has one of three states:
+
+- **Active** — authorized and included as a delivery target. An active device blocks early server deletion until it acknowledges applicable content or the 14-day maximum is reached.
+- **Dormant** — still cryptographically authorized, but no longer an active delivery target after more than 90 days without activity. Reconnecting automatically returns the device to active state after it proves its valid device authorization.
+- **Revoked** — explicitly removed from the identity by the user. A revoked device no longer receives content, no longer blocks deletion, and must be explicitly re-added before it can participate again.
+
+The server may determine inactivity and mark an authorized device dormant, but it must never revoke a device from an identity on its own.
 
 ## Device Retention
 

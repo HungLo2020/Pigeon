@@ -32,6 +32,35 @@
 - Clients reject unsigned, invalid, or older routing revisions.
 - No global authoritative Pigeon directory is required.
 
+## Device Lifecycle
+
+Every device associated with an identity is represented by an identity-authorized device credential and has one of three operational states.
+
+### Active
+
+- The device remains cryptographically authorized.
+- The server treats it as a current delivery target.
+- Applicable content must remain available for that device until it acknowledges delivery or the content reaches the 14-day server maximum.
+- A device that has been unused for days or weeks remains active until the 90-day inactivity threshold is reached or the user explicitly revokes it.
+
+### Dormant
+
+- An authorized device becomes dormant after more than **90 days** without activity.
+- Dormancy is an operational delivery state, not cryptographic revocation.
+- Dormant devices do not block early server deletion and are not included as required delivery targets for new content.
+- The server may mark a device dormant based on observed inactivity, but it may not remove that device's authorization from the identity.
+- When a dormant device reconnects, proves its still-valid device credential, and resumes use, it becomes active again automatically.
+- A returning dormant device may have history gaps because content outside the server's 14-day synchronization window may no longer exist on infrastructure.
+
+### Revoked
+
+- Revocation is an explicit user-authorized identity change.
+- The account/device-management UI must allow a user to view associated devices and revoke lost, stolen, retired, or unwanted devices.
+- A revoked device immediately stops being a required delivery target and no longer blocks deletion.
+- Future communication must not be delivered to a revoked device.
+- A revoked device cannot simply reactivate itself by reconnecting; it must be explicitly re-added to the identity through the normal device-authorization process.
+- Servers must never revoke devices from an identity on their own.
+
 ## Server Changes
 
 - Changing servers is an identity-level event, not a local-only preference.
@@ -48,11 +77,14 @@
 ## Server Retention
 
 - Servers store encrypted content only as a bounded synchronization/delivery window.
-- Content is retained for at most **14 days**, or until it has been delivered to **all currently authorized devices for the relevant identities**, whichever happens first.
-- Delivery acknowledgements are tracked per authorized device.
-- Revoked devices no longer block deletion.
+- Content is retained for at most **14 days**, or until it has been delivered to **all active authorized devices for the relevant identities**, whichever happens first.
+- The 14-day limit is a hard maximum for ordinary content even if an active device remains offline and has not acknowledged delivery.
+- Delivery acknowledgements are tracked per active authorized device.
+- Devices that become dormant or are revoked stop blocking early deletion.
+- A device that has merely been inactive for less than 90 days remains active and therefore still participates in delivery-completion decisions.
 - Server-side long-term conversation archives are not part of the architecture.
-- Small current control state needed for operation may persist while an identity uses the server, including authorized-device state, current routing revision, public device credentials, and delivery bookkeeping.
+- Small current control state needed for operation may persist while an identity uses the server, including authorized-device records, device state, last-seen timestamps, current routing revision, public device credentials, and delivery bookkeeping.
+- Control state is not subject to the same 14-day deletion rule as ordinary communication content when retaining current state is required for correct operation.
 
 ## Device Retention
 
@@ -66,20 +98,32 @@
   - forever
 - A device offline for less than the server retention window should be able to catch up entirely from the server.
 - A device offline beyond the server retention window may have a history gap unless another authorized device or user-controlled backup can supply it.
+- A dormant device returning after more than 90 days may rejoin automatically if it was never revoked, but should not expect infrastructure to reconstruct content older than the retained server window.
 
 ## Multi-Device Synchronization
 
 - The server is authoritative for recent delivery state and recent encrypted synchronization data.
-- Each authorized device independently synchronizes with the server when it connects.
+- Each active authorized device independently synchronizes with the server when it connects.
 - Devices do not depend on one another being online for normal recent synchronization.
 - Identity events such as adding/removing devices and changing servers are synchronized through the same mechanism.
+- Device-state changes between active and dormant must propagate as operational state so all current clients can display a consistent device list.
+- Explicit device revocations are signed identity events and must propagate to servers, the user's other devices, contacts, and group state wherever necessary to stop future delivery to the revoked credential.
 - Multiple devices may receive events in different orders but must converge on the same valid state.
+
+## Account / Device Management
+
+- Each client should expose an account/device-management page.
+- The page should show every known device associated with the identity.
+- At minimum it should show device name/type, current state, and last activity when available.
+- Users must be able to explicitly revoke a device from this interface.
+- The UI should clearly distinguish active, dormant, and revoked devices.
+- Dormancy must be reversible by reconnecting with the still-valid credential; revocation must not be reversible without explicit reauthorization.
 
 ## Implementation Structure
 
 - Rust is the primary implementation language.
 - The repository should be organized as a Cargo workspace.
-- Shared protocol, identity, cryptographic abstractions, serialization, routing records, event formats, and common types belong in `src/shared/`.
+- Shared protocol, identity, cryptographic abstractions, serialization, routing records, device-state records, event formats, and common types belong in `src/shared/`.
 - The server implementation belongs in `src/server/`.
 - The cross-platform application belongs in `src/client/`.
 - Platform-neutral client logic belongs in `src/client/core/` and must not depend on Tauri.
@@ -90,9 +134,11 @@
 ## Architecture Principles
 
 - Separate **identity** from **routing**.
+- Separate **authorization** from **delivery status**.
 - Separate **recent server synchronization** from **long-term device history**.
 - Represent each user with a long-lived cryptographic root identity.
 - Give each device its own key authorized by the user's identity.
+- Treat active/dormant status as server-observed operational state, while treating revocation as user-authorized cryptographic identity state.
 - Treat server routing as signed, replaceable metadata.
 - Let servers coordinate delivery and recent synchronization without making them permanent conversation archives.
 - Use well-reviewed cryptographic protocols rather than inventing new primitives.
@@ -105,16 +151,19 @@
 
 ## Trust Model
 
-- Pigeon servers are operationally authoritative for recent delivery and synchronization, but cryptographically subordinate to user identities.
-- Servers cannot create valid identity, device, or migration records without the appropriate user signatures.
+- Pigeon servers are operationally authoritative for recent delivery, synchronization, last-seen observations, and active/dormant status, but cryptographically subordinate to user identities.
+- Servers cannot create valid identity, device-authorization, device-revocation, or migration records without the appropriate user signatures.
+- A server may stop treating a device as an active delivery target after the protocol-defined inactivity period, but it cannot remove that device's cryptographic authorization.
 - TURN servers, SFUs, storage paths, and network operators are untrusted.
 - Infrastructure compromise must not reveal plaintext communication or permit user impersonation.
-- Infrastructure may learn unavoidable metadata such as IP addresses, timing, server choice, and traffic volume; minimizing this metadata is a design goal.
+- Infrastructure may learn unavoidable metadata such as IP addresses, timing, server choice, device activity, and traffic volume; minimizing this metadata is a design goal.
 
 ## Fundamental Invariants
 
 - Identity is not a server address.
 - Changing servers does not change who the user is.
-- A server stores only a bounded recent content window, not the user's permanent communication archive.
+- Device authorization is not the same thing as active delivery status.
+- More than 90 days of inactivity may make a device dormant, but only an authorized user action may revoke it.
+- A server stores ordinary content only for a bounded maximum of 14 days and may delete it sooner once every active authorized target has acknowledged delivery.
 - Long-term history belongs to user devices and user-controlled backups.
 - A newer valid signed routing revision always supersedes an older one.
