@@ -24,6 +24,18 @@
 - Operation across Wi-Fi, cellular, NAT, CGNAT, and changing networks.
 - Server loss must not destroy user identities or already-delivered conversation history.
 
+## Implementation Structure
+
+- Rust is the primary implementation language.
+- The repository should be organized as a Cargo workspace.
+- Shared protocol, identity, cryptographic abstractions, serialization, event formats, and common types belong in `src/shared/`.
+- The untrusted relay implementation belongs in `src/server/`.
+- The cross-platform application belongs in `src/client/`.
+- Platform-neutral client logic belongs in `src/client/core/` and must not depend on Tauri.
+- Tauri-specific application lifecycle, commands, permissions, notifications, and OS integration belong in `src/client/tauri/`.
+- Shared frontend code belongs in `src/client/frontend/`.
+- Non-code assets belong in `resources/`.
+
 ## Architecture Principles
 
 - Separate **identity** from **routing and delivery**.
@@ -41,6 +53,7 @@
 - Use STUN/ICE for NAT traversal and TURN when direct media paths fail.
 - Use an SFU for scalable group calls and streaming while keeping media end-to-end encrypted.
 - On iOS, use Apple push infrastructure only as a wake-up mechanism; message contents remain outside APNs.
+- Keep core client behavior independent of Tauri and operating-system-specific APIs.
 
 ## Trust Model
 
