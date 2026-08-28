@@ -6,4 +6,6 @@ The Pigeon client is shared across supported desktop and mobile platforms.
 - `tauri/` contains the Tauri application shell and platform integration.
 - `frontend/` contains the shared user interface.
 
-The client owns user keys, local state, encryption/decryption, synchronization, conversations, contacts, groups, and call state.
+The client owns identity authority, private keys, encryption/decryption, local conversation state, contacts, groups, server selection, routing verification, server migration, synchronization, and call state.
+
+A server may coordinate delivery, but the client must independently verify signed identity, device, and routing state.

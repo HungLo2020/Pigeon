@@ -1,3 +1,3 @@
 # Icons
 
-Application and platform-specific Pigeon icons belong in this directory.
+Application icon variants and icon-specific static assets for Pigeon belong here.

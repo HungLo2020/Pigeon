@@ -1,47 +1,71 @@
 # Pigeon
 
-Pigeon is a sovereign, end-to-end encrypted communication platform designed so that users—not servers, phone numbers, email providers, or third-party accounts—own their identities and communication history.
+Pigeon is a sovereign, end-to-end encrypted communication platform built around portable cryptographic identity rather than phone numbers, email addresses, or provider-owned accounts.
 
 ## Goals
 
-- Support direct text messaging and voice/video calls.
-- Support group text messaging and group voice/video calls.
-- Support Discord-style communities with persistent text channels and voice channels.
-- Support live video and screen streaming.
-- Run on mobile and desktop platforms, with iOS and Linux as primary targets.
-- Use cryptographic identities instead of phone numbers, email addresses, or provider-owned usernames.
-- End-to-end encrypt message contents, files, calls, streams, and group communication.
-- Treat every relay, server, mailbox, TURN server, SFU, and network path as untrusted and potentially hostile.
-- Keep identity ownership and delivered conversation history on user devices rather than on infrastructure.
-- Remain usable across arbitrary networks, including Wi-Fi, cellular, NAT, and carrier-grade NAT.
-- Provide reliable offline message delivery without requiring always-online peer-to-peer devices.
+- Direct text, voice, and video communication.
+- Group messaging and group voice/video calls.
+- Discord-style communities with persistent text and voice channels.
+- Live video and screen streaming.
+- iOS and Linux as primary client targets.
+- End-to-end encryption for messages, files, calls, streams, and group communication.
+- Reliable offline delivery across Wi-Fi, cellular, NAT, and CGNAT.
+- User identities that remain valid when changing servers.
+- Self-hosting without requiring every user to host infrastructure.
+- No global authoritative Pigeon identity directory.
 
-## Core Principle
+## Core Model
 
-Pigeon separates **ownership** from **delivery**.
+Pigeon separates **identity** from **routing**.
 
-- Identities belong to users and are represented cryptographically.
-- Devices hold identity and device keys.
-- Servers provide replaceable services such as temporary message queues, encrypted blob storage, NAT traversal, and media forwarding.
-- Infrastructure must not be able to impersonate users or decrypt communication.
-- Losing a relay or self-hosted server must not destroy a user's identity or already-delivered history.
+- A user's stable identity is a cryptographic public key.
+- A server address is mutable routing metadata, not part of the identity.
+- When sharing an identity, the user also shares a current server/routing hint.
+- Contacts cache each other's current signed routing records.
+- Routing records are versioned and signed by the identity owner.
+- A user may move from one server to another without changing identity.
+- Existing contacts learn moves through signed routing-update messages.
+- An old server may temporarily return a signed migration/forwarding record when available.
+- Servers coordinate delivery and synchronization for users currently using them, but cannot impersonate users or decrypt content.
+- There is no requirement for one server to own a conversation or for all servers to replicate all conversation history.
+
+## Server Role
+
+Pigeon servers are operationally authoritative but cryptographically constrained.
+
+They may manage:
+
+- current device/routing state for connected users
+- pending encrypted message delivery
+- acknowledgements and offline queues
+- presence and call signaling
+- encrypted attachment transfer/storage as required
+- TURN/SFU integration for media
+
+They must not own:
+
+- user identity keys
+- plaintext messages or media
+- authority to add devices without valid user authorization
+- authority to silently rewrite signed routing state
 
 ## Technology and Repository Layout
 
 - Pigeon is implemented primarily in Rust.
 - The repository is intended to be a Cargo workspace.
-- `src/shared/` contains platform-neutral protocol and shared library code used by both client and relay.
-- `src/server/` contains the untrusted relay/server implementation.
-- `src/client/` contains the shared client implementation.
+- `src/shared/` contains platform-neutral protocol and shared library code.
+- `src/server/` contains the Pigeon server implementation.
+- `src/client/` contains the shared cross-platform client.
 - `src/client/core/` contains UI- and platform-independent client logic.
 - `src/client/tauri/` contains the Tauri application shell and platform integration.
-- `src/client/frontend/` contains the shared Tauri frontend.
+- `src/client/frontend/` contains the shared frontend.
 - `resources/` contains non-source assets such as icons and bundled imagery.
 
-The client core should remain independent of Tauri so the communication, identity, cryptography, synchronization, and protocol logic can be reused across platforms without being tied to a specific UI framework.
+The client core must remain independent of Tauri so identity, cryptography, routing, messaging, synchronization, groups, and call logic can be reused across platforms.
 
 ## Status
 
 Pigeon is currently in the architecture and protocol-design phase.
 
-See [PROJECT.md](PROJECT.md) for the project requirements and proposed architecture.
+See [PROJECT.md](PROJECT.md) for the detailed project requirements and current architecture.

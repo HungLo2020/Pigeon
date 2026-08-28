@@ -9,4 +9,4 @@ Examples include:
 - bundled images
 - other static application resources
 
-Source code should remain under `src/`.
+Protocol, identity, routing, server, and client implementation code belongs under `src/`.
