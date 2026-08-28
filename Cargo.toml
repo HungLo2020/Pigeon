@@ -1,0 +1,27 @@
+[workspace]
+members = ["src/shared", "src/server", "src/client/core"]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bincode = "1.3"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+hex = "0.4"
+openmls = "0.9"
+openmls_basic_credential = "0.6"
+openmls_rust_crypto = "0.6"
+openmls_traits = "0.6"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = "0.23"
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.43", features = ["full"] }
+tokio-rustls = "0.26"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

@@ -1,0 +1,19 @@
+[package]
+name = "pigeon-shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+tls_codec = "0.5"

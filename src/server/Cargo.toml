@@ -1,0 +1,15 @@
+[package]
+name = "pigeon-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+clap.workspace = true
+rcgen.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+pigeon-shared = { path = "../shared" }
