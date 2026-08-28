@@ -25,8 +25,8 @@
     <!-- head overlaps the body; collar is drawn on top of their overlap -->
     <path id="head" fill="url(#body)" d="M508 501C540 454 553 396 575 326C603 237 665 180 753 179C843 178 910 235 924 317L908 401C905 484 953 543 1004 651C960 601 896 554 833 528C731 486 621 477 508 501Z"/>
     <!-- blue wing shadow and outer wing -->
-    <g id="outer-wing-shadow" clip-path="url(#outer-wing-shadow-bounds)"><path filter="url(#wing-shadow)" fill="url(#outer-wing)" d="M507 505C575 500 623 520 649 575C662 590 669 600 669 604C697 699 632 817 537 875C444 932 304 951 171 928C158 925 159 909 162 895C177 811 209 729 253 661C313 568 405 510 507 505Z"/></g>
-    <path id="outer-wing-shape" fill="url(#outer-wing)" d="M507 505C575 500 623 520 649 575C662 590 669 600 669 604C697 699 632 817 537 875C444 932 304 951 171 928C158 925 159 909 162 895C177 811 209 729 253 661C313 568 405 510 507 505Z"/>
+    <g id="outer-wing-shadow" clip-path="url(#outer-wing-shadow-bounds)"><path filter="url(#wing-shadow)" fill="url(#outer-wing)" d="M507 505C585 498 650 540 669 604C697 699 632 817 537 875C444 932 304 951 171 928C158 925 159 909 162 895C177 811 209 729 253 661C313 568 405 510 507 505Z"/></g>
+    <path id="outer-wing-shape" fill="url(#outer-wing)" d="M507 505C585 498 650 540 669 604C697 699 632 817 537 875C444 932 304 951 171 928C158 925 159 909 162 895C177 811 209 729 253 661C313 568 405 510 507 505Z"/>
     <!-- light wing panel and feather lobes -->
     <g id="inner-wing-layer" clip-path="url(#inner-wing-bounds)"><path id="inner-wing-shape" filter="url(#inner-wing-shadow)" fill="url(#inner-wing)" d="M504 528C568 528 626 553 649 601C668 641 659 680 633 708C599 744 550 747 517 718C500 751 467 777 429 781C394 784 371 773 340 753C310 795 271 819 234 813C213 810 202 796 200 776C243 685 297 616 362 574C406 545 454 529 504 528Z"/></g>
     <!-- closed collar sweep above head/body/wing junction -->
