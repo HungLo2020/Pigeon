@@ -6,12 +6,14 @@ Expected responsibilities include:
 
 - protocol types and wire formats
 - serialization and shared errors
-- cryptographic identity abstractions
-- device credentials and authorization records
+- cryptographic abstractions and identity types
+- device credentials and signed metadata
 - signed, versioned routing records
-- server-migration records
-- message, event, acknowledgement, and synchronization formats
-- cross-server delivery protocol types
-- group and call-signaling protocol types
+- server migration events
+- message and conversation event formats
+- per-device delivery acknowledgements
+- synchronization and retention metadata
 
-This crate should remain platform-neutral and must not contain Tauri-specific behavior.
+The shared protocol must distinguish stable cryptographic identity from mutable server routing information and support the 14-day-or-all-devices-delivered server retention rule.
+
+This crate should remain platform-neutral.

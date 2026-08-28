@@ -1,20 +1,33 @@
-# Server
+# Pigeon Server
 
-The Pigeon server provides reliable communication coordination without owning user identity.
+The Pigeon server provides reliable coordination and recent synchronization without owning user identity or permanent conversation history.
 
 Expected responsibilities include:
 
-- signed device/routing state for users currently using the server
-- encrypted message delivery and offline queues
-- acknowledgements and retention/expiry
-- presence and call signaling
-- encrypted blob/attachment transfer or bounded storage
-- TURN/SFU integration points
-- rate limiting and abuse/resource controls
-- cross-server delivery when communicating with users on other Pigeon servers
+- user/device registration using cryptographically verifiable identity and device records
+- current signed routing revision for identities using the server
+- encrypted message delivery and per-device acknowledgements
+- recent encrypted synchronization state
+- presence and connection coordination
+- encrypted attachment transfer/storage within the retention window
+- call signaling and integration points for TURN/SFU media infrastructure
+- temporary migration/forwarding records when an identity moves to another server
 
-The server is operationally authoritative for current delivery state, but cryptographically constrained by user and device signatures.
+## Retention
 
-It must never require plaintext message/media contents, possess user private identity keys, or treat its hostname as part of a user's identity.
+- Encrypted content is retained for at most **14 days**, or until it has been delivered to all currently authorized devices for the relevant identities, whichever happens first.
+- Revoked devices do not block deletion.
+- Long-term conversation archives must not be retained by the server as part of normal Pigeon operation.
+- Small operational control state may persist while an identity uses the server.
 
-Users must be able to migrate to another Pigeon server while keeping the same cryptographic identity.
+## Authority Boundary
+
+The server may be authoritative for recent delivery and synchronization state, but it must never:
+
+- own or redefine a user's cryptographic identity
+- add a valid device without appropriate cryptographic authorization
+- forge a valid server migration/routing revision
+- decrypt message contents
+- become the permanent canonical history store
+
+Server addresses are mutable routing metadata. A user moving to another server remains the same cryptographic identity.

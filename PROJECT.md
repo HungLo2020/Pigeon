@@ -2,17 +2,14 @@
 
 ## Problem
 
-- Modern messengers usually bind identity, routing, delivery, and history to one provider-controlled account or server.
-- Pure peer-to-peer systems avoid that dependency but can become unreliable when devices sleep, change networks, or are offline.
-- Pigeon aims to preserve user-owned identity and end-to-end encryption while still using servers strongly enough to provide reliable communication.
+- Existing communication systems commonly bind identity, routing, history, and service ownership together.
+- Pure peer-to-peer systems can avoid central ownership but often become unreliable when devices sleep, change networks, or are offline.
+- Pigeon aims to keep identity and long-term history user-owned while allowing servers to provide reliable coordination and recent synchronization.
 
 ## Non-Negotiable Requirements
 
 - No email address or phone number required.
 - User identity is cryptographic and independent of any server or external platform.
-- Users may choose or self-host a Pigeon server.
-- Changing servers must not change identity.
-- No global authoritative Pigeon identity directory.
 - Multi-device support without allowing a server to own or recreate a user's identity.
 - Direct and group text messaging.
 - Direct and group voice/video calls.
@@ -20,112 +17,104 @@
 - Live video and screen streaming.
 - iOS and Linux support, with room for additional platforms.
 - End-to-end encryption for messages, files, calls, streams, and group communication.
-- Servers and network infrastructure are untrusted with respect to message/media contents and identity authority.
-- Reliable offline message delivery.
+- Infrastructure is assumed hostile.
+- Reliable offline delivery and multi-device synchronization.
 - Operation across Wi-Fi, cellular, NAT, CGNAT, and changing networks.
+- Server loss must not destroy a user's identity or already-retained device history.
 
 ## Identity and Routing
 
-- A user's long-lived cryptographic public key is the stable public identity.
-- Server location is separate, mutable routing metadata.
-- A shared contact card/invitation carries both the stable identity and a current server/routing hint.
-- The server address is never part of the identity itself.
-- Contacts cache the latest verified routing record for each known identity.
-- Routing records are signed by the identity owner and include a monotonically increasing revision/version.
-- Clients reject unsigned, invalid, or stale routing changes.
-- A user does not need to know another user's server until that user shares or sends valid routing information.
+- A user's stable identity is a long-lived cryptographic identity key.
+- The server currently used by that identity is routing metadata, not part of the identity itself.
+- Public contact information carries the identity plus a current server hint.
+- Once contact is established, each side caches the latest valid signed routing record for the other identity.
+- Routing records are signed by the identity and monotonically versioned.
+- Clients reject unsigned, invalid, or older routing revisions.
+- No global authoritative Pigeon directory is required.
 
-## Server Migration
+## Server Changes
 
-- Moving from Server A to Server B must preserve the same cryptographic identity.
-- The moving client creates a newer signed routing record pointing to Server B.
-- Existing contacts receive the new record through normal Pigeon communication whenever possible.
-- If Server A is still available, it may temporarily return or forward a signed migration record directing contacts to Server B.
-- Contacts verify the identity signature and revision before replacing cached routing information.
-- If the old server disappears unexpectedly, the moved user can proactively contact known peers through their cached routes and distribute the new signed record.
-- Initial-contact or catastrophic-recovery cases may still require explicit out-of-band exchange; Pigeon should not introduce a central identity authority merely to eliminate that edge case.
+- Changing servers is an identity-level event, not a local-only preference.
+- A server migration produces a new signed routing record with a higher revision.
+- The initiating device should register with the new server first, then publish the signed migration through the old server when available.
+- The old server may temporarily return a signed `MOVED`/migration record directing contacts and other devices to the new server.
+- Other authorized devices automatically switch when they receive a newer valid routing revision.
+- Existing contacts should receive and cache the newer signed route through normal communication paths.
+- If the old server is unavailable, the migration remains valid: the initiating device queues the signed migration and propagates it through any reachable contact/server path.
+- A server change is not considered fully propagated until the user's reachable devices and active contacts have had an opportunity to learn the newer revision.
+- Devices that were offline may retain a stale route until they receive a newer signed revision; once received, they must switch automatically.
+- If every previously known route is unavailable and neither side has any surviving communication path, out-of-band re-contact may be required. Pigeon must not solve this by introducing a central authoritative identity directory.
 
-## Server Responsibilities
+## Server Retention
 
-A Pigeon server is authoritative for operational coordination while a user uses it, including:
+- Servers store encrypted content only as a bounded synchronization/delivery window.
+- Content is retained for at most **14 days**, or until it has been delivered to **all currently authorized devices for the relevant identities**, whichever happens first.
+- Delivery acknowledgements are tracked per authorized device.
+- Revoked devices no longer block deletion.
+- Server-side long-term conversation archives are not part of the architecture.
+- Small current control state needed for operation may persist while an identity uses the server, including authorized-device state, current routing revision, public device credentials, and delivery bookkeeping.
 
-- device registration state that is backed by valid user/device signatures
-- current delivery routing for attached users/devices
-- pending encrypted messages
-- delivery acknowledgements and offline retention
-- presence
-- call and media signaling
-- temporary or bounded encrypted blob/attachment storage
-- abuse controls and resource limits
-- media-relay integration such as TURN or SFU infrastructure
+## Device Retention
 
-A Pigeon server is not authoritative for:
+- Devices hold the user's long-term conversation history.
+- Local retention is configurable independently of the server window.
+- Initial retention options should include approximately:
+  - 30 days
+  - 90 days
+  - 1 year
+  - 5 years
+  - forever
+- A device offline for less than the server retention window should be able to catch up entirely from the server.
+- A device offline beyond the server retention window may have a history gap unless another authorized device or user-controlled backup can supply it.
 
-- the user's cryptographic identity
-- private identity/device keys
-- plaintext messages, files, calls, or streams
-- adding devices without valid authorization
-- changing a user's routing identity without a valid signed update
+## Multi-Device Synchronization
 
-## Cross-Server Communication
-
-- Servers are service providers, not identity owners.
-- A conversation does not have to belong to one server.
-- If Person X uses Server Y and Person Z uses Server A, each side communicates using the other participant's cached current route.
-- Servers do not need to replicate every conversation or maintain one global canonical message database.
-- Cross-server delivery should exchange only the coordination and encrypted payload data required for reliable communication.
-- A user may run a private server for family/friends while still communicating with users on other Pigeon servers.
-
-## Multi-Device Model
-
-- A root identity authorizes individual device keys.
-- Servers may coordinate currently authorized device state, but clients verify the underlying signatures.
-- Messages should be delivered to the appropriate authorized devices rather than assuming one device represents the user.
-- Outgoing events from one device must become visible to the user's other authorized devices through the normal synchronization/delivery model.
-- Multiple devices may receive events in different orders and must converge deterministically.
-- Historical-data migration to newly added devices is a separate concern from live message delivery and must not require making servers the permanent owner of plaintext history.
-
-## Cryptography and Trust
-
-- Use well-reviewed cryptographic protocols and primitives rather than inventing cryptography.
-- Evaluate MLS for asynchronous encrypted group state and messaging.
-- Infrastructure compromise must not reveal plaintext communication or permit user impersonation.
-- Infrastructure may learn unavoidable metadata such as IP addresses, timing, routing relationships, and traffic volume; minimizing this metadata is a design goal.
-
-## Calls and Media
-
-- Prefer direct peer-to-peer media when possible.
-- Use STUN/ICE for NAT traversal.
-- Use TURN when direct media paths fail.
-- Use an SFU for scalable group calls and streaming while preserving end-to-end media encryption.
-- On iOS, Apple push infrastructure may be used only as a wake-up mechanism; message contents must remain outside APNs.
+- The server is authoritative for recent delivery state and recent encrypted synchronization data.
+- Each authorized device independently synchronizes with the server when it connects.
+- Devices do not depend on one another being online for normal recent synchronization.
+- Identity events such as adding/removing devices and changing servers are synchronized through the same mechanism.
+- Multiple devices may receive events in different orders but must converge on the same valid state.
 
 ## Implementation Structure
 
 - Rust is the primary implementation language.
 - The repository should be organized as a Cargo workspace.
-- Shared protocol, identity, signed-routing, cryptographic abstractions, serialization, event formats, and common types belong in `src/shared/`.
-- The Pigeon server belongs in `src/server/`.
+- Shared protocol, identity, cryptographic abstractions, serialization, routing records, event formats, and common types belong in `src/shared/`.
+- The server implementation belongs in `src/server/`.
 - The cross-platform application belongs in `src/client/`.
 - Platform-neutral client logic belongs in `src/client/core/` and must not depend on Tauri.
 - Tauri-specific application lifecycle, commands, permissions, notifications, and OS integration belong in `src/client/tauri/`.
 - Shared frontend code belongs in `src/client/frontend/`.
 - Non-code assets belong in `resources/`.
 
-## Failure Model
+## Architecture Principles
 
-- A user may be offline for hours or days and should still receive queued messages later.
-- A phone may be suspended by the operating system and should recover cleanly after wake-up.
-- A selected server may disappear without warning.
-- A user may intentionally migrate to another server.
-- Individual devices may be lost or revoked.
-- Multiple devices may receive events in different orders and must converge on the same logical state.
-- Server migration must never require changing the user's cryptographic identity.
+- Separate **identity** from **routing**.
+- Separate **recent server synchronization** from **long-term device history**.
+- Represent each user with a long-lived cryptographic root identity.
+- Give each device its own key authorized by the user's identity.
+- Treat server routing as signed, replaceable metadata.
+- Let servers coordinate delivery and recent synchronization without making them permanent conversation archives.
+- Use well-reviewed cryptographic protocols rather than inventing new primitives.
+- Evaluate MLS for encrypted asynchronous group state and messaging.
+- Use direct peer-to-peer media when practical.
+- Use STUN/ICE for NAT traversal and TURN when direct media paths fail.
+- Use an SFU for scalable group calls and streaming while keeping media end-to-end encrypted.
+- On iOS, use Apple push infrastructure only as a wake-up mechanism; message contents remain outside APNs.
+- Keep core client behavior independent of Tauri and operating-system-specific APIs.
+
+## Trust Model
+
+- Pigeon servers are operationally authoritative for recent delivery and synchronization, but cryptographically subordinate to user identities.
+- Servers cannot create valid identity, device, or migration records without the appropriate user signatures.
+- TURN servers, SFUs, storage paths, and network operators are untrusted.
+- Infrastructure compromise must not reveal plaintext communication or permit user impersonation.
+- Infrastructure may learn unavoidable metadata such as IP addresses, timing, server choice, and traffic volume; minimizing this metadata is a design goal.
 
 ## Fundamental Invariants
 
-- **Identity is not a server address.**
-- **Routing is mutable, signed state.**
-- **Changing providers must not change who the user is.**
-- **Servers may coordinate communication but may not become cryptographic identity authorities.**
-- **No central Pigeon directory is required for normal communication between established contacts.**
+- Identity is not a server address.
+- Changing servers does not change who the user is.
+- A server stores only a bounded recent content window, not the user's permanent communication archive.
+- Long-term history belongs to user devices and user-controlled backups.
+- A newer valid signed routing revision always supersedes an older one.

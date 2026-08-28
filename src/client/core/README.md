@@ -4,16 +4,18 @@ Platform- and UI-independent Rust logic for the Pigeon client.
 
 Expected responsibilities include:
 
-- cryptographic identity and device management
+- identity and device management
+- signed routing records and server migration
 - encryption and decryption
-- contact and conversation state
-- signed routing-record creation and verification
-- current-server selection and migration
-- communication with local and remote Pigeon servers
-- reliable message/event synchronization across authorized devices
-- groups and community state
+- conversation and event state
+- server communication
+- per-device synchronization and acknowledgements
+- configurable local history retention
+- contacts and groups
 - call and media signaling state
 
-The client core must treat the identity key as stable and server addresses as replaceable routing information.
+The client core must treat server changes as identity events rather than local-only settings. It must accept only newer valid signed routing revisions and automatically follow them when another authorized device has migrated the identity.
+
+Normal recent synchronization should come from the current Pigeon server. Long-term history remains local to devices or user-controlled backups.
 
 This layer must not depend on Tauri so it can be reused across platforms and application shells.
