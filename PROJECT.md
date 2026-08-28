@@ -10,8 +10,14 @@
 
 - No email address or phone number required.
 - User identity is cryptographic and independent of any server or external platform.
+- Users can export and import a portable backup of their root identity
+  material to restore authority on a new device after device loss.
 - Multi-device support without allowing a server to own or recreate a user's identity.
 - Direct and group text messaging.
+- Ordinary group chats are ownerless: any participant may add or remove any
+  participant, without administrator or consent workflows.
+- Discord-style communities are distinct owner-governed objects and must not
+  be treated as ordinary group chats.
 - Direct and group voice/video calls.
 - Discord-style communities with persistent text and voice channels.
 - Live video and screen streaming.
@@ -27,6 +33,9 @@
 - A user's stable identity is a long-lived cryptographic identity key.
 - The server currently used by that identity is routing metadata, not part of the identity itself.
 - Public contact information carries the identity plus a current server hint.
+- A signed contact card is the canonical public-contact payload. QR codes,
+  copyable links/text, and shareable files are alternate encodings of the same
+  self-authenticating card.
 - Once contact is established, each side caches the latest valid signed routing record for the other identity.
 - Routing records are signed by the identity and monotonically versioned.
 - Clients reject unsigned, invalid, or older routing revisions.
@@ -35,6 +44,10 @@
 ## Device Lifecycle
 
 Every device associated with an identity is represented by an identity-authorized device credential and has one of three operational states.
+
+A physical device may host multiple independent Pigeon identities/accounts.
+Each account has independent identity authority, server routing, contacts, and
+local history.
 
 ### Active
 
@@ -143,6 +156,8 @@ Every device associated with an identity is represented by an identity-authorize
 - Let servers coordinate delivery and recent synchronization without making them permanent conversation archives.
 - Use well-reviewed cryptographic protocols rather than inventing new primitives.
 - Evaluate MLS for encrypted asynchronous group state and messaging.
+- Use MLS as the primary encrypted conversation-state protocol for direct
+  conversations, groups, and encrypted community channels.
 - Use direct peer-to-peer media when practical.
 - Use STUN/ICE for NAT traversal and TURN when direct media paths fail.
 - Use an SFU for scalable group calls and streaming while keeping media end-to-end encrypted.

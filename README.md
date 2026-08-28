@@ -19,7 +19,13 @@ Pigeon is a sovereign, end-to-end encrypted communication platform designed so t
 Pigeon separates **identity**, **routing**, **recent synchronization**, and **long-term history**.
 
 - A user's identity is a stable cryptographic identity and is not tied to a server.
+- Users control a portable backup of their root identity material.
+  Importing it on a new device restores authority over that identity, but does
+  not by itself recreate history that was not retained locally or backed up.
 - A user's current server is mutable signed routing metadata.
+- Contacts exchange self-authenticating signed contact cards containing a
+  public identity and current routing record. QR codes, copyable links/text,
+  and shareable contact files are interchangeable encodings of that card.
 - Contacts cache the latest valid signed routing record they have seen for each identity.
 - Servers coordinate delivery, device synchronization, presence, signaling, and recent encrypted content.
 - Servers retain content for at most 14 days, or until it has been delivered to all active authorized devices for the relevant identities, whichever happens first.
@@ -63,6 +69,12 @@ Server retention is intentionally much shorter than device retention.
 - `resources/` contains non-source assets such as icons and bundled imagery.
 
 The client core should remain independent of Tauri so communication, identity, cryptography, synchronization, retention, and protocol logic can be reused across platforms.
+
+## Architecture Decisions
+
+- [MLS for encrypted conversation state](docs/architecture/0001-mls-messaging.md)
+- [Sovereign identity and peer-discovered routing](docs/architecture/0002-sovereign-identity-and-peer-discovery.md)
+- [Devices, groups, relay, and first milestone](docs/architecture/0003-devices-groups-relay-and-first-milestone.md)
 
 ## Status
 
