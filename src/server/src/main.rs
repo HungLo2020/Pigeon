@@ -7,7 +7,6 @@ use pigeon_shared::{
     DeviceRevocation, RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::OsRng;
-use rcgen::generate_simple_self_signed;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{
@@ -15,16 +14,19 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, ServerConfig, SignatureScheme,
 };
 use std::{
-    fs,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::{self, Duration},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+mod tls;
+mod transport;
+use tls::ensure_certificate;
+use transport::{read_frame, write_frame};
 
 #[derive(Parser)]
 struct Args {
@@ -36,35 +38,6 @@ struct Args {
     certificate: String,
     #[arg(long, default_value = "pigeon-server-key.der")]
     private_key: String,
-}
-
-fn ensure_certificate(cert: &str, key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    if std::path::Path::new(cert).exists() && std::path::Path::new(key).exists() {
-        return Ok((fs::read(cert)?, fs::read(key)?));
-    }
-    let generated = generate_simple_self_signed(vec!["localhost".into()])?;
-    let certificate = generated.cert.der().to_vec();
-    let private_key = generated.key_pair.serialize_der();
-    fs::write(cert, &certificate)?;
-    fs::write(key, &private_key)?;
-    eprintln!("generated development TLS certificate at {cert}");
-    Ok((certificate, private_key))
-}
-
-async fn read_frame<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
-    let size = stream.read_u32().await? as usize;
-    if size > 16 * 1024 * 1024 {
-        bail!("frame too large");
-    }
-    let mut value = vec![0; size];
-    stream.read_exact(&mut value).await?;
-    Ok(value)
-}
-async fn write_frame<S: AsyncWriteExt + Unpin>(stream: &mut S, bytes: &[u8]) -> Result<()> {
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(bytes).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 const DORMANCY_SECONDS: i64 = 90 * 24 * 60 * 60;
@@ -746,6 +719,7 @@ mod tests {
         make_routing, MlsRecord,
     };
     use rand_core::OsRng;
+    use rcgen::generate_simple_self_signed;
     use x25519_dalek::StaticSecret;
 
     #[test]

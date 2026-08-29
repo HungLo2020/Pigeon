@@ -9,6 +9,9 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 
+mod state_mapping;
+use state_mapping::{hex_bytes, sort_conversations, unread_count};
+
 #[derive(Serialize, Clone)]
 struct Contact {
     id: String,
@@ -75,43 +78,6 @@ struct AccountEntry {
 struct AccountIndex {
     selected: Option<String>,
     accounts: Vec<AccountEntry>,
-}
-
-fn unread_count(
-    messages: &[Message],
-    identity: Option<&str>,
-    conversation: &str,
-    cursor: i64,
-) -> usize {
-    messages
-        .iter()
-        .filter(|message| {
-            message.conversation == conversation
-                && identity != Some(message.sender.as_str())
-                && message.timestamp > cursor
-        })
-        .count()
-}
-
-fn sort_conversations(conversations: &mut [Conversation]) {
-    conversations.sort_by(|left, right| {
-        right
-            .timestamp
-            .cmp(&left.timestamp)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-}
-
-fn hex_bytes(value: Option<&serde_json::Value>) -> String {
-    value
-        .and_then(serde_json::Value::as_array)
-        .map(|bytes| {
-            bytes
-                .iter()
-                .filter_map(|byte| byte.as_u64().map(|n| format!("{n:02x}")))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn app_data(app: &tauri::AppHandle) -> Result<PathBuf, String> {

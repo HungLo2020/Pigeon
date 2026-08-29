@@ -1,18 +1,11 @@
 import "./style.css";
 import pigeonIcon from "../../../../resources/pigeon.svg";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-
-type Contact = { id: string; server: string };
-type Message = { conversation: string; sender: string; text: string; timestamp: number };
-type Conversation = { id: string; title: string; kind: "direct" | "group"; preview?: string; timestamp?: number; unread: number };
-type Device = { id: string; state: "active" | "dormant" | "revoked"; last_activity?: number };
-type Route = { server: string; revision: number; relay_fingerprint: string; tls_spki_fingerprint: string };
-type LocalAccount = { id: string; label: string; identity: string };
-type Account = { identity?: string; server?: string; contacts: Contact[]; conversations: Conversation[]; devices: Device[]; route?: Route; messages: Message[]; state_exists: boolean; accounts: LocalAccount[]; selected_account?: string; needs_relay: boolean };
-type Api = { status(): Promise<Account>; createAccount(): Promise<void>; importAccount(backup:string): Promise<void>; selectAccount(id: string): Promise<void>; configureRelay(server: string): Promise<void>; migrateRelay(server:string): Promise<void>; send(to: string, text: string): Promise<void>; groupSend(group: string, text: string): Promise<void>; importContact(card: string): Promise<void>; shareCard(): Promise<string>; markRead(conversation: string): Promise<void> };
-const api: Api = { status: () => invoke("account_status"), createAccount: () => invoke("create_account"), importAccount: backup=>invoke("import_account",{backup}), selectAccount: id => invoke("select_account", { id }), configureRelay: server => invoke("configure_relay", { server }), migrateRelay: server=>invoke("migrate_relay",{server}), send: (to, text) => invoke("send_direct", { to, text }), groupSend: (group, text) => invoke("send_group", { group, text }), importContact: card => invoke("import_contact", { card }), shareCard: () => invoke("share_card"), markRead: conversation => invoke("mark_read", { conversation }) };
+import { api } from "./api";
+import type { Account } from "./types";
+import { esc, stamp } from "./format";
+import { chatList as chatListView } from "./chats";
 
 let account: Account;
 let selected = "";
@@ -24,8 +17,6 @@ let relayDraft = "";
 const messageDrafts = new Map<string, string>();
 const app = document.querySelector<HTMLDivElement>("#app")!;
 type EditorSnapshot = { key: string; draftKey?: string; selectionStart: number | null; selectionEnd: number | null };
-const esc = (value: string) => value.replace(/[&<>"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]!));
-const stamp = (value?: number) => value ? new Date(value * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
 const flash = (message: string) => { notice = message; render(); window.setTimeout(() => { notice = ""; render(); }, 3500); };
 async function refresh() { account = await api.status(); render(); }
 async function openConversation(id: string) { selected = id; page = "chats"; await api.markRead(id); await refresh(); }
@@ -58,7 +49,7 @@ function restoreEditor(snapshot?: EditorSnapshot) {
     editor.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
   }
 }
-function chatList() { return account.conversations.map(c => `<button class="conversation ${selected === c.id ? "active" : ""}" data-conversation="${c.id}"><span class="avatar ${c.kind === "group" ? "group" : ""}">${c.kind === "group" ? "#" : c.title.slice(0, 2)}</span><span class="conversation-copy"><b>${esc(c.title)}</b><small>${esc(c.preview ?? "No messages yet")}</small></span><span class="conversation-meta"><small>${stamp(c.timestamp)}</small>${c.unread ? `<em>${c.unread}</em>` : ""}</span></button>`).join("") || `<p class="empty">No conversations yet. Add a signed contact card to begin.</p>`; }
+function chatList() { return chatListView(account.conversations, selected); }
 function contactsPage() { return `<section class="panel contacts-panel"><header class="panel-heading"><div><p class="eyebrow">PEOPLE</p><h1>Contacts</h1><p>Paste a signed contact card. Pigeon verifies it in Rust before saving it.</p></div><button class="secondary" id="share-card">Copy my card</button></header><form id="import-contact" class="contact-form"><label for="contact-card">Contact card</label><textarea required id="contact-card" name="card" placeholder="Paste a Pigeon contact card" aria-describedby="contact-help">${esc(contactDraft)}</textarea><small id="contact-help">Your paste remains here until Pigeon confirms the contact was added.</small><div><button type="submit">Add contact</button><button type="button" class="secondary" id="clear-contact" ${contactDraft ? "" : "disabled"}>Clear</button></div></form><div class="rows contact-rows">${account.contacts.map(c => `<div><span class="avatar">${c.id.slice(0,2)}</span><span><b>${c.id.slice(0, 16)}</b><small>${esc(c.server)}</small></span></div>`).join("") || "<p class=empty>No contacts yet. Add a verified contact card to start a chat.</p>"}</div></section>`; }
 function devicesPage() { const rows = account.devices.map(d => `<div><span class="device-state ${d.state}"></span><span><b>${d.id.slice(0, 20)}</b><small>${d.state}${d.last_activity ? ` · ${stamp(d.last_activity)}` : " · activity not yet reported by relay"}</small></span></div>`).join("") || "<p class=empty>No device roster available.</p>"; return `<section class="panel"><h1>Devices & account</h1><p>Device authorization is signed by your root identity.</p><div class="rows">${rows}</div></section>`; }
 function settingsPage() { const r = account.route; if (!relayDraft) relayDraft = r?.server ?? account.server ?? ""; return `<section class="panel"><h1>Settings</h1><h2>Accounts</h2><div class="rows">${account.accounts.map(a => `<button data-switch-account="${a.id}" ${a.id === account.selected_account ? "disabled" : ""}><b>${esc(a.label)}</b><small>${a.identity.slice(0, 16)}${a.id === account.selected_account ? " · current" : ""}</small></button>`).join("")}</div><p><button id="settings-create-account">Create account</button> <button id="settings-import-account" class="secondary">Import backup</button></p><h2>Relay</h2><p>Changing relay creates a newer signed routing record for this account only.</p><form id="relay-form" class="contact-form"><label for="relay-address">Relay address</label><input required id="relay-address" name="server" value="${esc(relayDraft)}" placeholder="127.0.0.1:8443"><div><button type="submit">Change relay</button></div></form><div class="rows"><div><b>Current relay</b><small>${esc(r?.server ?? account.server ?? "Unavailable")}</small></div><div><b>Routing revision</b><small>${r?.revision ?? "Unavailable"}</small></div><div><b>Relay identity fingerprint</b><small class="fingerprint">${r?.relay_fingerprint ?? "Unavailable"}</small></div><div><b>TLS SPKI pin</b><small class="fingerprint">${r?.tls_spki_fingerprint ?? "Unavailable"}</small></div></div></section>`; }

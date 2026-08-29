@@ -9,8 +9,8 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
     decode, encode, identity_id, make_card, make_card_with_devices, make_device, make_revocation,
-    make_routing, routing_precedes, AuthorizedDeviceSet, ContactCard, DeviceRecord,
-    DeviceRevocation, RelayDescriptor, Request, Response, RoutingRecord,
+    make_routing, AuthorizedDeviceSet, ContactCard, DeviceRecord, DeviceRevocation,
+    RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -19,12 +19,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, fs, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -32,48 +27,16 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use x25519_dalek::StaticSecret;
 
+mod history;
+mod messaging;
+mod routing;
+mod storage;
+use history::message_time;
+use messaging::{unwrap_mls_payload, wrap_mls_payload};
+use routing::should_replace_route;
+use storage::{load, save};
+
 type PersistedMlsIdentity = (Vec<u8>, Vec<u8>, HashMap<String, String>);
-const DISCOVERY_ENVELOPE_MAGIC: &[u8] = b"PIGEONMD";
-const DISCOVERY_ENVELOPE_VERSION: u8 = 1;
-
-/// Kept inside the relay-opaque MLS payload so that adding reciprocal contact
-/// discovery never changes the durable relay record format.  The recipient
-/// verifies every value before it reaches local contact/routing state.
-#[derive(Serialize, Deserialize)]
-struct DiscoveryEnvelope {
-    version: u8,
-    mls_payload: Vec<u8>,
-    sender_card: ContactCard,
-    sender_route: RoutingRecord,
-}
-
-fn wrap_mls_payload(state: &State, mls_payload: Vec<u8>) -> Result<Vec<u8>> {
-    let sender_route = state
-        .routing
-        .clone()
-        .context("cannot send MLS data before this account has a signed route")?;
-    let mut payload = DISCOVERY_ENVELOPE_MAGIC.to_vec();
-    payload.extend(bincode::serialize(&DiscoveryEnvelope {
-        version: DISCOVERY_ENVELOPE_VERSION,
-        mls_payload,
-        sender_card: state.card.clone(),
-        sender_route,
-    })?);
-    Ok(payload)
-}
-
-fn unwrap_mls_payload(payload: Vec<u8>) -> Result<(Vec<u8>, Option<DiscoveryEnvelope>)> {
-    if !payload.starts_with(DISCOVERY_ENVELOPE_MAGIC) {
-        // Existing relay-retained events predate discovery and are raw MLS.
-        return Ok((payload, None));
-    }
-    let envelope: DiscoveryEnvelope =
-        bincode::deserialize(&payload[DISCOVERY_ENVELOPE_MAGIC.len()..])?;
-    if envelope.version != DISCOVERY_ENVELOPE_VERSION {
-        bail!("unsupported MLS discovery envelope version")
-    }
-    Ok((envelope.mls_payload.clone(), Some(envelope)))
-}
 
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -116,25 +79,6 @@ struct LocalMessage {
     sender: String,
     text: String,
     timestamp: i64,
-}
-fn message_time() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-fn should_replace_route(current: Option<&RoutingRecord>, candidate: &RoutingRecord) -> bool {
-    match current {
-        None => true,
-        Some(current) if candidate.revision > current.revision => true,
-        Some(current)
-            if candidate.revision == current.revision
-                && candidate.parent_revision == current.parent_revision =>
-        {
-            routing_precedes(candidate, current)
-        }
-        _ => false,
-    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct GroupState {
@@ -220,19 +164,6 @@ enum Command {
     },
 }
 
-fn load(path: &str) -> Result<State> {
-    let state: State = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read identity state {path}"))?,
-    )?;
-    if state.routing.is_none() && state.state_version == 0 {
-        bail!("legacy identity state has no versioned relay-bound routing record; re-import from a current backup")
-    }
-    Ok(state)
-}
-fn save(path: &str, state: &State) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(state)?)?;
-    Ok(())
-}
 fn create_mls_identity(device_id: &[u8]) -> Result<PersistedMlsIdentity> {
     let provider = OpenMlsRustCrypto::default();
     let suite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -1274,9 +1205,8 @@ async fn main() -> Result<()> {
                         .build();
                     for (_record_id, record) in records {
                         let (mls_payload, discovery) = unwrap_mls_payload(record.payload)?;
-                        if let Some(discovery) = discovery {
-                            let card = &discovery.sender_card;
-                            pigeon_shared::verify_card(card)?;
+                        if let Some((card, route)) = discovery {
+                            pigeon_shared::verify_card(&card)?;
                             if !card
                                 .devices
                                 .iter()
@@ -1284,7 +1214,7 @@ async fn main() -> Result<()> {
                             {
                                 bail!("sender contact card does not authorize MLS sender device")
                             }
-                            let sender_identity = identity_id(card);
+                            let sender_identity = identity_id(&card);
                             if sender_identity == identity_id(&state.card) {
                                 bail!("received MLS record claims this account as sender")
                             }
@@ -1299,17 +1229,16 @@ async fn main() -> Result<()> {
                                 None => state.contacts.push(card.clone()),
                                 _ => {}
                             }
-                            let route = &discovery.sender_route;
                             if route.identity != sender_identity || route.server != card.server {
                                 bail!("sender routing record does not match sender contact card")
                             }
                             validate_route_descriptor(
-                                route,
-                                &pinned_relay_descriptor(route).await?,
+                                &route,
+                                &pinned_relay_descriptor(&route).await?,
                             )?;
                             let route_key = hex::encode(sender_identity);
-                            if should_replace_route(state.cached_routes.get(&route_key), route) {
-                                state.cached_routes.insert(route_key, route.clone());
+                            if should_replace_route(state.cached_routes.get(&route_key), &route) {
+                                state.cached_routes.insert(route_key, route);
                             }
                         }
                         let incoming = MlsMessageIn::tls_deserialize_exact(mls_payload.clone())?;
