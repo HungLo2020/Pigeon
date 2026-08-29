@@ -1,1 +1,4 @@
 /target/
+src/client/frontend/node_modules/
+src/client/frontend/dist/
+src/client/tauri/gen/

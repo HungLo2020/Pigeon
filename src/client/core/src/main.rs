@@ -19,7 +19,12 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -52,6 +57,26 @@ struct State {
     cached_routes: HashMap<String, RoutingRecord>,
     #[serde(default)]
     groups: HashMap<String, GroupState>,
+    #[serde(default)]
+    history: Vec<LocalMessage>,
+    /// Per-device read cursors.  This belongs beside the device's MLS state,
+    /// rather than in a frontend cache, so unread state survives restart and
+    /// applies equally to CLI and GUI sync.
+    #[serde(default)]
+    read_at: HashMap<String, i64>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct LocalMessage {
+    conversation: String,
+    sender: String,
+    text: String,
+    timestamp: i64,
+}
+fn message_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct GroupState {
@@ -112,6 +137,10 @@ enum Command {
         group: String,
         #[arg(long)]
         member: String,
+    },
+    MarkRead {
+        #[arg(long)]
+        conversation: String,
     },
     Fetch,
     RevokeDevice {
@@ -438,6 +467,8 @@ async fn main() -> Result<()> {
                 pending_routing: vec![],
                 cached_routes: HashMap::new(),
                 groups: HashMap::new(),
+                history: vec![],
+                read_at: HashMap::new(),
             };
             response_ok(
                 request(
@@ -635,6 +666,12 @@ async fn main() -> Result<()> {
                 .await?,
             )?;
             persist_mls(&mut state, &provider)?;
+            state.history.push(LocalMessage {
+                conversation: conversation.clone(),
+                sender: hex::encode(identity_id(&state.card)),
+                text,
+                timestamp: message_time(),
+            });
             save(&args.state, &state)?;
             println!("sent");
         }
@@ -718,6 +755,14 @@ async fn main() -> Result<()> {
                 .to_bytes()?;
             deliver_group_payload(&state, &args.certificate, &group_state.members, payload).await?;
             persist_mls(&mut state, &provider)?;
+            state.history.push(LocalMessage {
+                // Store the protocol group ID, not a user supplied alias.
+                // Incoming group messages use this same stable identifier.
+                conversation: format!("group:{}", hex::encode(mls_group.group_id().as_slice())),
+                sender: hex::encode(identity_id(&state.card)),
+                text,
+                timestamp: message_time(),
+            });
             save(&args.state, &state)?;
             println!("sent");
         }
@@ -1019,6 +1064,11 @@ async fn main() -> Result<()> {
             save(&args.state, &state)?;
             println!("migrated to {server}");
         }
+        Command::MarkRead { conversation } => {
+            let mut state = load(&args.state)?;
+            state.read_at.insert(conversation, message_time());
+            save(&args.state, &state)?;
+        }
         Command::Fetch => {
             let mut state = load(&args.state)?;
             for contact in state.contacts.clone() {
@@ -1170,11 +1220,31 @@ async fn main() -> Result<()> {
                                 let processed = group.process_message(&provider, protocol)?;
                                 match processed.into_content() {
                                     ProcessedMessageContent::ApplicationMessage(message) => {
-                                        println!(
-                                            "{}: {}",
-                                            key,
-                                            String::from_utf8(message.into_bytes())?
-                                        );
+                                        let conversation = if state
+                                            .groups
+                                            .contains_key(&protocol_group)
+                                        {
+                                            format!("group:{protocol_group}")
+                                        } else {
+                                            state
+                                                .contacts
+                                                .iter()
+                                                .find(|contact| {
+                                                    contact.devices.iter().any(|device| {
+                                                        device.device_id == record.sender_device
+                                                    })
+                                                })
+                                                .map(|contact| hex::encode(identity_id(contact)))
+                                                .unwrap_or(key.clone())
+                                        };
+                                        let text = String::from_utf8(message.into_bytes())?;
+                                        println!("{}: {}", key, text);
+                                        state.history.push(LocalMessage {
+                                            conversation,
+                                            sender: key,
+                                            text,
+                                            timestamp: message_time(),
+                                        });
                                     }
                                     ProcessedMessageContent::StagedCommitMessage(staged) => {
                                         group.merge_staged_commit(&provider, *staged)?;
