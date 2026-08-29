@@ -1,7 +1,9 @@
 export type Contact = { id: string; server: string };
 export type Message = { conversation: string; sender: string; text: string; timestamp: number };
 export type Conversation = { id: string; title: string; kind: "direct" | "group"; preview?: string; timestamp?: number; unread: number };
-export type Device = { id: string; state: "active" | "dormant" | "revoked"; last_activity?: number };
+export type Device = { id: string; state: "active" | "dormant" | "revoked"; current: boolean; last_activity?: number };
 export type Route = { server: string; revision: number; relay_fingerprint: string; tls_spki_fingerprint: string };
 export type LocalAccount = { id: string; label: string; identity: string };
-export type Account = { identity?: string; server?: string; contacts: Contact[]; conversations: Conversation[]; devices: Device[]; route?: Route; messages: Message[]; state_exists: boolean; accounts: LocalAccount[]; selected_account?: string; needs_relay: boolean };
+export type PairingStatus = { state: "waiting" | "cancelled" | "expired"; identity: string; device_id: string; expires_at: number; request_text: string };
+export type PairingRequestDetails = { identity: string; device_id: string; expires_at: number };
+export type Account = { identity?: string; server?: string; contacts: Contact[]; conversations: Conversation[]; devices: Device[]; route?: Route; messages: Message[]; state_exists: boolean; accounts: LocalAccount[]; selected_account?: string; needs_relay: boolean; pairing?: PairingStatus };

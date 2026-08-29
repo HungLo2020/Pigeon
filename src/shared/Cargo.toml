@@ -18,3 +18,4 @@ openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = "0.5"
 x509-parser.workspace = true
+hpke = { version = "0.14", features = ["aes", "x25519"] }

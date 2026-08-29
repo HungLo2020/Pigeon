@@ -2,11 +2,386 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use pigeon_shared::{
     make_card, make_card_with_devices, make_device, make_relay_forward, make_revocation,
-    make_routing, MlsRecord,
+    make_routing, MlsRecord, PairingArtifactKind, PairingRelayArtifact,
 };
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
 use x25519_dalek::StaticSecret;
+
+fn pairing_artifact(
+    kind: PairingArtifactKind,
+    session: u8,
+    capability: u8,
+    payload: Vec<u8>,
+) -> PairingRelayArtifact {
+    PairingRelayArtifact {
+        version: 1,
+        identity: [7; 32],
+        session_id: [session; 16],
+        nonce: [9; 16],
+        kind,
+        expires_at: 100,
+        capability_commitment: pigeon_shared::capability_commitment(&[capability; 32]),
+        payload,
+    }
+}
+
+#[test]
+fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let request = pairing_artifact(PairingArtifactKind::PublicRequest, 1, 0, vec![1, 2]);
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(request.clone()), 1),
+        Response::Ok
+    ));
+    assert!(
+        matches!(process_at(&db, Request::FetchPairingRequest { identity:[7;32], session_id:[1;16] }, 1), Response::PairingArtifact(a) if a.payload == vec![1,2])
+    );
+    let stored: Vec<u8> = db
+        .query_row(
+            "SELECT payload FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3",
+            params![
+                [7u8; 32].to_vec(),
+                [1u8; 16].to_vec(),
+                encode(&PairingArtifactKind::PublicRequest).unwrap()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, encode(&request).unwrap());
+    let bootstrap = pairing_artifact(PairingArtifactKind::EncryptedBootstrap, 1, 4, vec![9, 8, 7]);
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(bootstrap.clone()), 1),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process_at(
+            &db,
+            Request::FetchConsumePairingBootstrap {
+                identity: [7; 32],
+                session_id: [1; 16],
+                capability: [3; 32]
+            },
+            1
+        ),
+        Response::PairingUnauthorized
+    ));
+    assert!(
+        matches!(process_at(&db, Request::FetchConsumePairingBootstrap { identity:[7;32], session_id:[1;16], capability:[4;32] }, 1), Response::PairingArtifact(a) if a.payload == bootstrap.payload)
+    );
+    assert!(matches!(
+        process_at(
+            &db,
+            Request::FetchConsumePairingBootstrap {
+                identity: [7; 32],
+                session_id: [1; 16],
+                capability: [4; 32]
+            },
+            1
+        ),
+        Response::PairingConsumed
+    ));
+    assert!(matches!(
+        process_at(
+            &db,
+            Request::FetchPairingRequest {
+                identity: [7; 32],
+                session_id: [2; 16]
+            },
+            1
+        ),
+        Response::PairingNotFound
+    ));
+}
+
+#[test]
+fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
+    let path = std::env::temp_dir().join(format!(
+        "pigeon-pairing-{}-{}.sqlite",
+        std::process::id(),
+        system_now()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let bootstrap = pairing_artifact(PairingArtifactKind::EncryptedBootstrap, 3, 6, vec![5, 4, 3]);
+    {
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        let request = pairing_artifact(PairingArtifactKind::PublicRequest, 3, 6, vec![1]);
+        assert!(matches!(
+            process_at(&db, Request::PublishPairingArtifact(request), 1),
+            Response::Ok
+        ));
+        assert!(matches!(
+            process_at(&db, Request::PublishPairingArtifact(bootstrap.clone()), 1),
+            Response::Ok
+        ));
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::PublishPairingArtifact(pairing_artifact(
+                    PairingArtifactKind::PublicRequest,
+                    7,
+                    0,
+                    vec![2]
+                )),
+                1
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::CancelPairing {
+                    identity: [7; 32],
+                    session_id: [3; 16],
+                    capability: [8; 32]
+                },
+                1
+            ),
+            Response::PairingUnauthorized
+        ));
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::CancelPairing {
+                    identity: [7; 32],
+                    session_id: [3; 16],
+                    capability: [6; 32]
+                },
+                1
+            ),
+            Response::PairingCancelled
+        ));
+    }
+    {
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::FetchConsumePairingBootstrap {
+                    identity: [7; 32],
+                    session_id: [3; 16],
+                    capability: [6; 32]
+                },
+                1
+            ),
+            Response::PairingCancelled
+        ));
+        let mut expired = pairing_artifact(PairingArtifactKind::PublicRequest, 4, 0, vec![1]);
+        expired.expires_at = 2;
+        assert!(matches!(
+            process_at(&db, Request::PublishPairingArtifact(expired), 1),
+            Response::Ok
+        ));
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::FetchPairingRequest {
+                    identity: [7; 32],
+                    session_id: [4; 16]
+                },
+                2
+            ),
+            Response::PairingExpired
+        ));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn pairing_publish_rejects_mismatched_bindings_without_affecting_other_sessions() {
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    let request = pairing_artifact(PairingArtifactKind::PublicRequest, 5, 0, vec![1]);
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(request.clone()), 1),
+        Response::Ok
+    ));
+    let mut nonce_mismatch =
+        pairing_artifact(PairingArtifactKind::EncryptedBootstrap, 5, 4, vec![2]);
+    nonce_mismatch.nonce = [8; 16];
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(nonce_mismatch), 1),
+        Response::Error(_)
+    ));
+    let mut identity_mismatch = pairing_artifact(PairingArtifactKind::PublicRequest, 5, 0, vec![3]);
+    identity_mismatch.identity = [6; 32];
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(identity_mismatch), 1),
+        Response::Ok
+    ));
+    let mut commitment_mismatch = request.clone();
+    commitment_mismatch.capability_commitment = pigeon_shared::capability_commitment(&[9; 32]);
+    assert!(matches!(
+        process_at(&db, Request::PublishPairingArtifact(commitment_mismatch), 1),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        process_at(&db, Request::FetchPairingRequest { identity:[7;32], session_id:[5;16] }, 1),
+        Response::PairingArtifact(a) if a.payload == request.payload
+    ));
+    assert!(matches!(
+        process_at(&db, Request::FetchPairingRequest { identity:[6;32], session_id:[5;16] }, 1),
+        Response::PairingArtifact(a) if a.payload == vec![3]
+    ));
+    assert!(matches!(
+        process_at(
+            &db,
+            Request::FetchConsumePairingBootstrap {
+                identity: [7; 32],
+                session_id: [5; 16],
+                capability: [4; 32]
+            },
+            1
+        ),
+        Response::PairingUnauthorized
+    ));
+}
+
+#[test]
+fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "pigeon-pairing-consume-{}-{}.sqlite",
+        std::process::id(),
+        system_now()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let bootstrap = pairing_artifact(PairingArtifactKind::EncryptedBootstrap, 6, 4, vec![7, 7]);
+    {
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::PublishPairingArtifact(pairing_artifact(
+                    PairingArtifactKind::PublicRequest,
+                    6,
+                    0,
+                    vec![1]
+                )),
+                1
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            process_at(&db, Request::PublishPairingArtifact(bootstrap.clone()), 1),
+            Response::Ok
+        ));
+
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::PublishPairingArtifact(pairing_artifact(
+                    PairingArtifactKind::PublicRequest,
+                    7,
+                    0,
+                    vec![2]
+                )),
+                1
+            ),
+            Response::Ok
+        ));
+
+        // A malformed or metadata-substituted stored envelope is rejected before the
+        // row is marked consumed. This also protects independent sessions.
+        let mut wrong_identity = bootstrap.clone();
+        wrong_identity.identity = [3; 32];
+        let mut wrong_session = bootstrap.clone();
+        wrong_session.session_id = [3; 16];
+        let mut wrong_nonce = bootstrap.clone();
+        wrong_nonce.nonce = [3; 16];
+        let mut wrong_kind = bootstrap.clone();
+        wrong_kind.kind = PairingArtifactKind::Approval;
+        let mut wrong_commitment = bootstrap.clone();
+        wrong_commitment.capability_commitment = pigeon_shared::capability_commitment(&[3; 32]);
+        for substituted in [
+            wrong_identity,
+            wrong_session,
+            wrong_nonce,
+            wrong_kind,
+            wrong_commitment,
+        ] {
+            db.execute(
+                "UPDATE pairing_artifacts SET payload=?1 WHERE identity=?2 AND session=?3 AND kind=?4",
+                params![
+                    encode(&substituted).unwrap(),
+                    [7u8; 32].to_vec(),
+                    [6u8; 16].to_vec(),
+                    encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
+                ],
+            )
+            .unwrap();
+            assert!(matches!(
+                process_at(
+                    &db,
+                    Request::FetchConsumePairingBootstrap {
+                        identity: [7; 32],
+                        session_id: [6; 16],
+                        capability: [4; 32]
+                    },
+                    1
+                ),
+                Response::Error(_)
+            ));
+        }
+        let consumed: i64 = db
+            .query_row(
+                "SELECT consumed FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3",
+                params![
+                    [7u8; 32].to_vec(),
+                    [6u8; 16].to_vec(),
+                    encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 0);
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::FetchPairingRequest {
+                    identity: [7; 32],
+                    session_id: [7; 16]
+                },
+                1
+            ),
+            Response::PairingArtifact(a) if a.payload == vec![2]
+        ));
+        db.execute(
+            "UPDATE pairing_artifacts SET payload=?1 WHERE identity=?2 AND session=?3 AND kind=?4",
+            params![
+                encode(&bootstrap).unwrap(),
+                [7u8; 32].to_vec(),
+                [6u8; 16].to_vec(),
+                encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            process_at(&db, Request::FetchConsumePairingBootstrap { identity:[7;32], session_id:[6;16], capability:[4;32] }, 1),
+            Response::PairingArtifact(a) if a.payload == bootstrap.payload
+        ));
+    }
+    {
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        assert!(matches!(
+            process_at(
+                &db,
+                Request::FetchConsumePairingBootstrap {
+                    identity: [7; 32],
+                    session_id: [6; 16],
+                    capability: [4; 32]
+                },
+                1
+            ),
+            Response::PairingConsumed
+        ));
+    }
+    let _ = std::fs::remove_file(path);
+}
 
 #[test]
 fn fetch_pairs_sql_id_with_decoded_mls_record() {

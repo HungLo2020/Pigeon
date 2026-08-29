@@ -25,6 +25,12 @@ Accepted.
 The backup is equivalent to possession of the root authority. The product must
 make this consequence clear without requiring a passphrase for export.
 
+Authorized devices are equal peers: each holds the root identity private key
+and a distinct device credential. Revoking a device removes its credential
+from the current roster and delivery/MLS state, but cannot erase root material
+already copied to it. Root-key compromise therefore requires a separate future
+recovery/key-rotation protocol.
+
 ## Multi-device conversation model
 
 For MLS purposes, each authorized device is an independently authenticated

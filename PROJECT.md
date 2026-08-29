@@ -31,6 +31,9 @@
 ## Identity and Routing
 
 - A user's stable identity is a long-lived cryptographic identity key.
+- Every authorized device is an equal peer: it holds the same root identity
+  private key and a distinct device private key/credential. No server or
+  device is a privileged master authority.
 - The server currently used by that identity is routing metadata, not part of the identity itself.
 - Public contact information carries the identity plus a current server hint.
 - A signed contact card is the canonical public-contact payload. QR codes,
@@ -73,6 +76,11 @@ local history.
 - Future communication must not be delivered to a revoked device.
 - A revoked device cannot simply reactivate itself by reconnecting; it must be explicitly re-added to the identity through the normal device-authorization process.
 - Servers must never revoke devices from an identity on their own.
+- Revocation removes the device credential from the current authorized roster,
+  MLS memberships, and future delivery targets. It cannot erase root identity
+  material that was previously copied to that device. Extracted root material
+  is a catastrophic identity compromise requiring a separate future
+  recovery/key-rotation protocol, not ordinary device revocation.
 
 ## Server Changes
 

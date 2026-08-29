@@ -8,8 +8,11 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
-    decode, encode, identity_id, make_card, make_card_with_devices, make_device, make_revocation,
-    make_routing, AuthorizedDeviceSet, ContactCard, DeviceRecord, DeviceRevocation,
+    capability_commitment, decode, encode, identity_id, make_card, make_card_with_devices,
+    make_device, make_pairing_approval, make_revocation, make_routing, open_bootstrap,
+    seal_bootstrap, verify_device_set, verify_pairing_approval, verify_pairing_request,
+    AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord, DeviceRevocation,
+    EncryptedBootstrap, PairingApproval, PairingArtifactKind, PairingRelayArtifact, PairingRequest,
     RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
@@ -19,13 +22,14 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
-use x25519_dalek::StaticSecret;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 mod history;
 mod messaging;
@@ -84,6 +88,24 @@ struct LocalMessage {
 struct GroupState {
     group_id: Vec<u8>,
     members: Vec<[u8; 32]>,
+}
+#[derive(Serialize, Deserialize)]
+struct PendingPairing {
+    request: PairingRequest,
+    device_secret: [u8; 32],
+    mls_signer: Vec<u8>,
+    mls_storage: HashMap<String, String>,
+    hpke_secret: [u8; 32],
+    bootstrap_capability: [u8; 32],
+    cancel_capability: [u8; 32],
+    server: String,
+    #[serde(default)]
+    cancelled: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct BootstrapControl {
+    encryption_secret: [u8; 32],
+    card: ContactCard,
 }
 #[derive(Parser)]
 struct Args {
@@ -154,6 +176,18 @@ enum Command {
         /// Hex-encoded stable device ID from the account's authorized roster.
         device_id: String,
     },
+    PairRequest {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        server: String,
+    },
+    PairApprove {
+        /// Base64url pairing request emitted by `pair-request`.
+        request: String,
+    },
+    PairConsume,
+    PairCancel,
     Migrate {
         #[arg(long)]
         server: String,

@@ -165,6 +165,301 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 hex::encode(identity_id(&state.card))
             );
         }
+        Command::PairRequest { identity, server } => {
+            let identity = parse_identity(&identity)?;
+            let pending_path = pairing_state_path(&args.state);
+            if std::path::Path::new(&pending_path).exists() {
+                bail!("a pairing request is already pending for this state path")
+            }
+            let device_signing = SigningKey::generate(&mut OsRng);
+            let (mls_key_package, mls_signer, mls_storage) =
+                create_mls_identity(&device_signing.verifying_key().to_bytes())?;
+            let mut hpke_secret = [0; 32];
+            let mut bootstrap_capability = [0; 32];
+            let mut cancel_capability = [0; 32];
+            OsRng.fill_bytes(&mut hpke_secret);
+            OsRng.fill_bytes(&mut bootstrap_capability);
+            OsRng.fill_bytes(&mut cancel_capability);
+            let hpke_public = PublicKey::from(&StaticSecret::from(hpke_secret));
+            let mut session_id = [0; 16];
+            let mut nonce = [0; 16];
+            OsRng.fill_bytes(&mut session_id);
+            OsRng.fill_bytes(&mut nonce);
+            let now = pairing_now();
+            let request_value = PairingRequest {
+                version: pigeon_shared::PAIRING_VERSION,
+                identity,
+                session_id,
+                nonce,
+                expires_at: now + 10 * 60,
+                device: DeviceRecord {
+                    identity,
+                    device_id: device_signing.verifying_key().to_bytes(),
+                    device_key: device_signing.verifying_key().to_bytes(),
+                    mls_key_package,
+                    authorization_revision: 0,
+                    signature: vec![],
+                },
+                hpke_public_key: hpke_public.to_bytes(),
+                bootstrap_capability_commitment: capability_commitment(&bootstrap_capability),
+                cancel_capability_commitment: capability_commitment(&cancel_capability),
+            };
+            verify_pairing_request(&request_value, now)?;
+            let artifact = PairingRelayArtifact {
+                version: pigeon_shared::PAIRING_VERSION,
+                identity,
+                session_id,
+                nonce,
+                kind: PairingArtifactKind::PublicRequest,
+                expires_at: request_value.expires_at,
+                capability_commitment: request_value.cancel_capability_commitment,
+                payload: encode(&request_value)?,
+            };
+            response_ok(
+                request(
+                    &server,
+                    &args.certificate,
+                    Request::PublishPairingArtifact(artifact),
+                )
+                .await?,
+            )?;
+            save_pairing(
+                &pending_path,
+                &PendingPairing {
+                    request: request_value.clone(),
+                    device_secret: device_signing.to_bytes(),
+                    mls_signer,
+                    mls_storage,
+                    hpke_secret,
+                    bootstrap_capability,
+                    cancel_capability,
+                    server,
+                    cancelled: false,
+                },
+            )?;
+            println!(
+                "{}",
+                STANDARD_NO_PAD.encode(serde_json::to_vec(&request_value)?)
+            );
+        }
+        Command::PairApprove {
+            request: request_text,
+        } => {
+            let mut state = load(&args.state)?;
+            let pairing_request: PairingRequest =
+                serde_json::from_slice(&STANDARD_NO_PAD.decode(request_text.trim())?)?;
+            let now = pairing_now();
+            verify_pairing_request(&pairing_request, now)?;
+            if pairing_request.identity != identity_id(&state.card) {
+                bail!("pairing request is for a different identity")
+            }
+            let root = SigningKey::from_bytes(&state.signing_secret);
+            let revision = state.authorized_devices.revision + 1;
+            let provisional =
+                pigeon_shared::authorize_pairing_device(&root, &pairing_request.device, revision);
+            if state
+                .authorized_devices
+                .devices
+                .iter()
+                .any(|device| device.device_id == provisional.device_id)
+            {
+                bail!("pairing device is already authorized")
+            }
+            let mut roster = state.authorized_devices.clone();
+            roster.revision = revision;
+            roster.devices.push(provisional);
+            verify_device_set(&roster)?;
+            let card = make_card_with_devices(
+                &root,
+                &StaticSecret::from(state.encryption_secret),
+                state.card.server.clone(),
+                roster.devices.clone(),
+                state.card.revision + 1,
+            );
+            let bootstrap = BootstrapPayload {
+                version: pigeon_shared::PAIRING_VERSION,
+                root_secret: state.signing_secret,
+                roster: roster.clone(),
+                routing: state.routing.clone(),
+                contacts: state.contacts.clone(),
+                control_state: encode(&BootstrapControl {
+                    encryption_secret: state.encryption_secret,
+                    card: card.clone(),
+                })?,
+                // Existing device MLS private state and history are deliberately excluded.
+                mls_bootstrap: vec![],
+            };
+            let encrypted = seal_bootstrap(&pairing_request, &bootstrap)?;
+            let approval = make_pairing_approval(
+                &root,
+                &pairing_request,
+                &roster,
+                Sha256::digest(encode(&encrypted)?).into(),
+            )?;
+            verify_pairing_approval(&pairing_request, &approval, now)?;
+            response_ok(
+                request(
+                    &state.card.server,
+                    &args.certificate,
+                    Request::Register {
+                        card: card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
+                )
+                .await?,
+            )?;
+            state.authorized_devices = roster.clone();
+            state.card = card.clone();
+            add_paired_device_to_mls_groups(&mut state, &args.certificate, &pairing_request.device)
+                .await?;
+            let approval_artifact = PairingRelayArtifact {
+                version: pigeon_shared::PAIRING_VERSION,
+                identity: pairing_request.identity,
+                session_id: pairing_request.session_id,
+                nonce: pairing_request.nonce,
+                kind: PairingArtifactKind::Approval,
+                expires_at: pairing_request.expires_at,
+                capability_commitment: pairing_request.bootstrap_capability_commitment,
+                payload: encode(&approval)?,
+            };
+            response_ok(
+                request(
+                    &state.card.server,
+                    &args.certificate,
+                    Request::PublishPairingArtifact(approval_artifact),
+                )
+                .await?,
+            )?;
+            let bootstrap_artifact = PairingRelayArtifact {
+                version: pigeon_shared::PAIRING_VERSION,
+                identity: pairing_request.identity,
+                session_id: pairing_request.session_id,
+                nonce: pairing_request.nonce,
+                kind: PairingArtifactKind::EncryptedBootstrap,
+                expires_at: pairing_request.expires_at,
+                capability_commitment: pairing_request.bootstrap_capability_commitment,
+                payload: encode(&(approval, encrypted))?,
+            };
+            response_ok(
+                request(
+                    &state.card.server,
+                    &args.certificate,
+                    Request::PublishPairingArtifact(bootstrap_artifact),
+                )
+                .await?,
+            )?;
+            save(&args.state, &state)?;
+            println!("pairing approved");
+        }
+        Command::PairConsume => {
+            let pending_path = pairing_state_path(&args.state);
+            let pending = load_pairing(&pending_path)?;
+            if pending.cancelled {
+                bail!("pairing session is cancelled")
+            }
+            let now = pairing_now();
+            verify_pairing_request(&pending.request, now)?;
+            let response = request(
+                &pending.server,
+                &args.certificate,
+                Request::FetchConsumePairingBootstrap {
+                    identity: pending.request.identity,
+                    session_id: pending.request.session_id,
+                    capability: pending.bootstrap_capability,
+                },
+            )
+            .await?;
+            let Response::PairingArtifact(artifact) = response else {
+                bail!("pairing bootstrap is not available: {response:?}")
+            };
+            if artifact.identity != pending.request.identity
+                || artifact.session_id != pending.request.session_id
+                || artifact.nonce != pending.request.nonce
+                || artifact.kind != PairingArtifactKind::EncryptedBootstrap
+                || artifact.capability_commitment != pending.request.bootstrap_capability_commitment
+            {
+                bail!("relay returned a mismatched pairing bootstrap envelope")
+            }
+            let (approval, encrypted): (PairingApproval, EncryptedBootstrap) =
+                decode(&artifact.payload)?;
+            verify_pairing_approval(&pending.request, &approval, now)?;
+            if Sha256::digest(encode(&encrypted)?).as_slice() != approval.bootstrap_hash {
+                bail!("pairing bootstrap does not match its signed approval")
+            }
+            let bootstrap = open_bootstrap(&pending.request, pending.hpke_secret, &encrypted)?;
+            verify_device_set(&bootstrap.roster)?;
+            if bootstrap.roster.identity != pending.request.identity
+                || bootstrap.roster.revision != approval.roster_revision
+                || Sha256::digest(encode(&bootstrap.roster)?).as_slice() != approval.roster_digest
+                || !bootstrap
+                    .roster
+                    .devices
+                    .iter()
+                    .any(|device| device.device_id == pending.request.device.device_id)
+            {
+                bail!("bootstrap roster does not authorize this device")
+            }
+            let control: BootstrapControl = decode(&bootstrap.control_state)?;
+            if identity_id(&control.card) != pending.request.identity {
+                bail!("bootstrap card identity mismatch")
+            }
+            let state = State {
+                state_version: 1,
+                signing_secret: bootstrap.root_secret,
+                encryption_secret: control.encryption_secret,
+                card: control.card,
+                contacts: bootstrap.contacts,
+                mls_storage: pending.mls_storage,
+                mls_conversations: HashMap::new(),
+                direct_groups: HashMap::new(),
+                mls_signer: pending.mls_signer,
+                device: approval.device,
+                authorized_devices: bootstrap.roster,
+                revocations: vec![],
+                routing: bootstrap.routing,
+                pending_routing: vec![],
+                cached_routes: HashMap::new(),
+                groups: HashMap::new(),
+                history: vec![],
+                read_at: HashMap::new(),
+            };
+            response_ok(
+                request(
+                    &state.card.server,
+                    &args.certificate,
+                    Request::Register {
+                        card: state.card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
+                )
+                .await?,
+            )?;
+            save(&args.state, &state)?;
+            fs::remove_file(pending_path)?;
+            println!("pairing complete");
+        }
+        Command::PairCancel => {
+            let pending_path = pairing_state_path(&args.state);
+            let mut pending = load_pairing(&pending_path)?;
+            let response = request(
+                &pending.server,
+                &args.certificate,
+                Request::CancelPairing {
+                    identity: pending.request.identity,
+                    session_id: pending.request.session_id,
+                    capability: pending.cancel_capability,
+                },
+            )
+            .await?;
+            if !matches!(response, Response::PairingCancelled) {
+                bail!("pairing cancellation was rejected: {response:?}")
+            }
+            pending.cancelled = true;
+            save_pairing(&pending_path, &pending)?;
+            println!("pairing cancelled");
+        }
         Command::Card => println!("{}", card_text(&load(&args.state)?.card)?),
         Command::AddContact { card } => {
             let mut state = load(&args.state)?;
@@ -980,4 +1275,72 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         }
     };
     Ok(())
+}
+
+fn pairing_state_path(state: &str) -> String {
+    format!("{state}.pairing")
+}
+
+fn load_pairing(path: &str) -> Result<PendingPairing> {
+    serde_json::from_slice(&fs::read(path).with_context(|| format!("read pairing state {path}"))?)
+        .with_context(|| format!("decode pairing state {path}"))
+}
+
+fn save_pairing(path: &str, pending: &PendingPairing) -> Result<()> {
+    fs::write(path, serde_json::to_vec_pretty(pending)?)
+        .with_context(|| format!("write pairing state {path}"))?;
+    Ok(())
+}
+
+fn pairing_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn add_paired_device_to_mls_groups(
+    state: &mut State,
+    certificate: &str,
+    device: &DeviceRecord,
+) -> Result<()> {
+    let (provider, signer) = mls_runtime(state)?;
+    let mut group_ids: Vec<Vec<u8>> = state
+        .mls_conversations
+        .values()
+        .cloned()
+        .chain(state.groups.values().map(|group| group.group_id.clone()))
+        .collect();
+    group_ids.sort();
+    group_ids.dedup();
+    for group_bytes in group_ids {
+        let group_id = GroupId::tls_deserialize_exact(group_bytes)?;
+        let mut group = MlsGroup::load(provider.storage(), &group_id)?
+            .context("persisted MLS group missing while adding paired device")?;
+        if group.members().any(|member| {
+            member.credential == BasicCredential::new(device.device_id.to_vec()).into()
+        }) {
+            continue;
+        }
+        let package = KeyPackageIn::tls_deserialize_exact(device.mls_key_package.clone())?
+            .validate(provider.crypto(), ProtocolVersion::Mls10)?;
+        let (commit, welcome, _) = group.add_members(&provider, &signer, &[package])?;
+        group.merge_pending_commit(&provider)?;
+        response_ok(
+            request(
+                &state.card.server,
+                certificate,
+                Request::SendMls(pigeon_shared::MlsRecord {
+                    recipient_identity: identity_id(&state.card),
+                    sender_device: state.device.device_id,
+                    target_devices: vec![device.device_id],
+                    payload: wrap_mls_payload(state, welcome.to_bytes()?)?,
+                }),
+            )
+            .await?,
+        )?;
+        let members = identities_in_mls_group(state, &group);
+        deliver_group_payload(state, certificate, &members, commit.to_bytes()?).await?;
+    }
+    persist_mls(state, &provider)
 }

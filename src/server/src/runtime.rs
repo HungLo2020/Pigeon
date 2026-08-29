@@ -13,6 +13,31 @@ pub(crate) use relay::{bind_relay_tls_spki, set_relay_address};
 use relay::{relay_address, relay_identity, relay_signer, relay_tls_spki};
 pub(crate) use schema::initialize;
 
+type PairingRequestRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+type PairingBootstrapRow = (i64, i64, i64, Vec<u8>, Vec<u8>);
+
+fn decode_indexed_pairing_artifact(
+    bytes: &[u8],
+    identity: [u8; 32],
+    session_id: [u8; 16],
+    nonce: &[u8],
+    kind: PairingArtifactKind,
+    expiry: i64,
+    commitment: &[u8],
+) -> Result<pigeon_shared::PairingRelayArtifact> {
+    let artifact: pigeon_shared::PairingRelayArtifact = decode(bytes)?;
+    if artifact.identity != identity
+        || artifact.session_id != session_id
+        || artifact.nonce.as_slice() != nonce
+        || artifact.kind != kind
+        || artifact.expires_at != expiry
+        || artifact.capability_commitment.as_slice() != commitment
+    {
+        bail!("stored pairing envelope does not match its indexed session metadata")
+    }
+    Ok(artifact)
+}
+
 fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
     let result: Result<Response> = (|| {
         maintain_lifecycle(connection, now)?;
@@ -276,6 +301,116 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                 identity: relay_identity(connection)?,
                 tls_spki_fingerprint: relay_tls_spki(connection)?,
             })),
+            Request::PublishPairingArtifact(artifact) => {
+                pigeon_shared::verify_pairing_artifact(&artifact, now)?;
+                let kind = encode(&artifact.kind)?;
+                let session_nonce: Option<Vec<u8>> = connection
+                    .query_row(
+                        "SELECT nonce FROM pairing_artifacts WHERE identity=?1 AND session=?2 LIMIT 1",
+                        params![artifact.identity.to_vec(), artifact.session_id.to_vec()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match session_nonce {
+                    Some(nonce) if nonce != artifact.nonce => {
+                        bail!("pairing session nonce conflict")
+                    }
+                    None if artifact.kind != PairingArtifactKind::PublicRequest => {
+                        bail!("pairing request must be published before protected artifacts")
+                    }
+                    _ => {}
+                }
+                let existing: Option<(Vec<u8>, Vec<u8>)> = connection.query_row("SELECT nonce, commitment FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3", params![artifact.identity.to_vec(), artifact.session_id.to_vec(), kind.clone()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                if let Some((nonce, commitment)) = existing {
+                    if nonce != artifact.nonce
+                        || commitment != artifact.capability_commitment.to_vec()
+                    {
+                        bail!("pairing session binding conflict")
+                    }
+                    bail!("pairing artifact already published")
+                }
+                // The envelope is the opaque relay artifact.  Metadata is indexed separately
+                // only to enforce lifecycle and capability checks; fetches must reconstruct the
+                // exact envelope the publisher supplied.
+                let encoded_artifact = encode(&artifact)?;
+                connection.execute("INSERT INTO pairing_artifacts (identity,session,nonce,kind,expiry,commitment,payload) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![artifact.identity.to_vec(),artifact.session_id.to_vec(),artifact.nonce.to_vec(),kind,artifact.expires_at,artifact.capability_commitment.to_vec(),encoded_artifact])?;
+                Ok(Response::Ok)
+            }
+            Request::FetchPairingRequest {
+                identity,
+                session_id,
+            } => {
+                let kind = encode(&PairingArtifactKind::PublicRequest)?;
+                let row: Option<PairingRequestRow> = connection.query_row("SELECT expiry,payload,commitment,nonce FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3 AND cancelled=0",params![identity.to_vec(),session_id.to_vec(),kind],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                match row {
+                    Some((expiry, _, _, _)) if expiry <= now => Ok(Response::PairingExpired),
+                    Some((expiry, bytes, commitment, nonce)) => {
+                        Ok(Response::PairingArtifact(decode_indexed_pairing_artifact(
+                            &bytes,
+                            identity,
+                            session_id,
+                            &nonce,
+                            PairingArtifactKind::PublicRequest,
+                            expiry,
+                            &commitment,
+                        )?))
+                    }
+                    None => Ok(Response::PairingNotFound),
+                }
+            }
+            Request::FetchConsumePairingBootstrap {
+                identity,
+                session_id,
+                capability,
+            } => {
+                let kind = encode(&PairingArtifactKind::EncryptedBootstrap)?;
+                let commitment = pigeon_shared::capability_commitment(&capability).to_vec();
+                let tx = connection.unchecked_transaction()?;
+                let row:Option<PairingBootstrapRow>=tx.query_row("SELECT expiry,cancelled,consumed,payload,nonce FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3 AND commitment=?4",params![identity.to_vec(),session_id.to_vec(),kind,commitment.clone()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+                let response = match row {
+                    None => Response::PairingUnauthorized,
+                    Some((expiry, _, _, _, _)) if expiry <= now => Response::PairingExpired,
+                    Some((_, 1, _, _, _)) => Response::PairingCancelled,
+                    Some((_, _, 1, _, _)) => Response::PairingConsumed,
+                    Some((expiry, _, _, bytes, nonce)) => {
+                        let artifact = decode_indexed_pairing_artifact(
+                            &bytes,
+                            identity,
+                            session_id,
+                            &nonce,
+                            PairingArtifactKind::EncryptedBootstrap,
+                            expiry,
+                            &commitment,
+                        )?;
+                        tx.execute("UPDATE pairing_artifacts SET consumed=1 WHERE identity=?1 AND session=?2 AND kind=?3 AND commitment=?4",params![identity.to_vec(),session_id.to_vec(),kind, commitment])?;
+                        Response::PairingArtifact(artifact)
+                    }
+                };
+                tx.commit()?;
+                Ok(response)
+            }
+            Request::CancelPairing {
+                identity,
+                session_id,
+                capability,
+            } => {
+                let commitment = pigeon_shared::capability_commitment(&capability).to_vec();
+                // Cancellation is authorized by the commitment published on
+                // the public request. Once proved, it cancels every opaque
+                // artifact in that session without revealing any of them.
+                let request_kind = encode(&PairingArtifactKind::PublicRequest)?;
+                let authorized: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3 AND commitment=?4 AND consumed=0)", params![identity.to_vec(),session_id.to_vec(),request_kind,commitment], |r| r.get(0))?;
+                let changed = if authorized {
+                    connection.execute("UPDATE pairing_artifacts SET cancelled=1 WHERE identity=?1 AND session=?2 AND consumed=0",params![identity.to_vec(),session_id.to_vec()])?
+                } else {
+                    0
+                };
+                Ok(if changed == 0 {
+                    Response::PairingUnauthorized
+                } else {
+                    Response::PairingCancelled
+                })
+            }
             Request::QueueForward { record, route } => {
                 verify_routing(&route)?;
                 if record.recipient_identity != route.identity {

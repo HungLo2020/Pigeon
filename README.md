@@ -75,6 +75,7 @@ The client core should remain independent of Tauri so communication, identity, c
 - [MLS for encrypted conversation state](docs/architecture/0001-mls-messaging.md)
 - [Sovereign identity and peer-discovered routing](docs/architecture/0002-sovereign-identity-and-peer-discovery.md)
 - [Devices, groups, relay, and first milestone](docs/architecture/0003-devices-groups-relay-and-first-milestone.md)
+- [Secure add-device authorization and bootstrap](docs/architecture/0005-secure-add-device-bootstrap.md)
 
 ## Status
 

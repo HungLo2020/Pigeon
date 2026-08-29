@@ -67,6 +67,113 @@ fn client_args(state: &Path, certificate: &Path, command: Vec<String>) -> Vec<St
 }
 
 #[test]
+fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let server_bin = root.join("target/debug/pigeon-server");
+    if !server_bin.exists() {
+        assert!(Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "build",
+                "--quiet",
+                "-p",
+                "pigeon-server",
+                "--bin",
+                "pigeon-server"
+            ])
+            .status()
+            .expect("build relay")
+            .success());
+    }
+    let client_bin = PathBuf::from(env!("CARGO_BIN_EXE_pigeon-client"));
+    let directory = std::env::temp_dir().join(format!(
+        "pigeon-pairing-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let address = "127.0.0.1:39420";
+    let mut relay = server(&server_bin, address, &directory, "pairing");
+    let certificate = directory.join("pairing.der");
+    wait_for(&certificate);
+    thread::sleep(Duration::from_millis(150));
+    let existing = directory.join("existing.json");
+    let joining = directory.join("joining.json");
+    let root_id = id(&run(
+        &client_bin,
+        &client_args(
+            &existing,
+            &certificate,
+            vec!["create".into(), "--server".into(), address.into()],
+        ),
+    ));
+    let pairing_request = run(
+        &client_bin,
+        &client_args(
+            &joining,
+            &certificate,
+            vec![
+                "pair-request".into(),
+                "--identity".into(),
+                root_id.clone(),
+                "--server".into(),
+                address.into(),
+            ],
+        ),
+    );
+    // The pending request is local durable state and the relay session is
+    // SQLite-backed, so an interruption between request and approval is safe.
+    let _ = relay.kill();
+    let _ = relay.wait();
+    relay = server(&server_bin, address, &directory, "pairing");
+    thread::sleep(Duration::from_millis(150));
+    run(
+        &client_bin,
+        &client_args(
+            &existing,
+            &certificate,
+            vec!["pair-approve".into(), pairing_request.trim().into()],
+        ),
+    );
+    run(
+        &client_bin,
+        &client_args(&joining, &certificate, vec!["pair-consume".into()]),
+    );
+    let existing_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&existing).unwrap()).unwrap();
+    let joining_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&joining).unwrap()).unwrap();
+    assert_eq!(
+        existing_state["card"]["signing_key"],
+        joining_state["card"]["signing_key"]
+    );
+    assert_ne!(
+        existing_state["device"]["device_id"],
+        joining_state["device"]["device_id"]
+    );
+    assert_eq!(
+        existing_state["authorized_devices"]["devices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        joining_state["authorized_devices"]["devices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let _ = relay.kill();
+    let _ = relay.wait();
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let server_bin = root.join("target/debug/pigeon-server");

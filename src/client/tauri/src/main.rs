@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -34,6 +35,7 @@ struct Conversation {
 struct Device {
     id: String,
     state: String,
+    current: bool,
     /// Last activity is relay-observed data and is intentionally absent until
     /// the server exposes a signed account-status query.
     last_activity: Option<i64>,
@@ -66,6 +68,21 @@ struct AccountStatus {
     accounts: Vec<AccountEntry>,
     selected_account: Option<String>,
     needs_relay: bool,
+    pairing: Option<PairingStatus>,
+}
+#[derive(Serialize, Clone)]
+struct PairingStatus {
+    state: String,
+    identity: String,
+    device_id: String,
+    expires_at: i64,
+    request_text: String,
+}
+#[derive(Serialize, Clone)]
+struct PairingRequestDetails {
+    identity: String,
+    device_id: String,
+    expires_at: i64,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct AccountEntry {
@@ -96,6 +113,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             accounts: account_index.accounts,
             selected_account: None,
             needs_relay: false,
+            pairing: None,
         });
     }
     let path = state_path(&app)?;
@@ -113,6 +131,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             accounts: account_index.accounts,
             selected_account: account_index.selected,
             needs_relay: false,
+            pairing: pairing_status(&app).ok().flatten(),
         });
     }
     let value: serde_json::Value =
@@ -177,6 +196,8 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .map(|device| Device {
             id: hex_bytes(device.get("device_id")),
             state: "active".into(),
+            current: hex_bytes(device.get("device_id"))
+                == hex_bytes(value.pointer("/device/device_id")),
             last_activity: None,
         })
         .collect();
@@ -185,6 +206,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             devices.push(Device {
                 id,
                 state: "revoked".into(),
+                current: false,
                 last_activity: None,
             });
         }
@@ -299,7 +321,51 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         accounts: account_index.accounts,
         selected_account: account_index.selected,
         needs_relay: value.get("routing").is_none(),
+        pairing: pairing_status(&app).ok().flatten(),
     })
+}
+
+fn pairing_status(app: &tauri::AppHandle) -> Result<Option<PairingStatus>, String> {
+    let path = state_path(app)?;
+    let pending = path.with_extension("json.pairing");
+    if !pending.exists() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pending).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let request = value
+        .get("request")
+        .ok_or("pending pairing request is missing")?;
+    Ok(Some(PairingStatus {
+        state: if value
+            .get("cancelled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "cancelled".into()
+        } else if request
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            <= SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs() as i64
+        {
+            "expired".into()
+        } else {
+            "waiting".into()
+        },
+        identity: hex_bytes(request.get("identity")),
+        device_id: hex_bytes(request.pointer("/device/device_id")),
+        expires_at: request
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        request_text: STANDARD_NO_PAD
+            .encode(serde_json::to_vec(request).map_err(|e| e.to_string())?),
+    }))
 }
 #[tauri::command]
 fn create_account(app: tauri::AppHandle) -> Result<(), String> {
@@ -383,6 +449,95 @@ fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
     save_index(&app, &account_index)
 }
 #[tauri::command]
+fn begin_pairing(
+    app: tauri::AppHandle,
+    identity: String,
+    server: String,
+) -> Result<String, String> {
+    let id = format!(
+        "pairing-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    let mut account_index = index(&app)?;
+    let previous_selected = account_index.selected.clone();
+    account_index.selected = Some(id.clone());
+    account_index.accounts.push(AccountEntry {
+        id: id.clone(),
+        label: "Pending device pairing".into(),
+        identity: identity.clone(),
+    });
+    save_index(&app, &account_index)?;
+    match core(
+        &app,
+        &[
+            "pair-request".into(),
+            "--identity".into(),
+            identity,
+            "--server".into(),
+            server,
+        ],
+    ) {
+        Ok(request) => Ok(request.trim().into()),
+        Err(error) => {
+            account_index.selected = previous_selected;
+            account_index.accounts.retain(|account| account.id != id);
+            save_index(&app, &account_index)?;
+            Err(error)
+        }
+    }
+}
+#[tauri::command]
+fn pairing_request_details(request: String) -> Result<PairingRequestDetails, String> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &STANDARD_NO_PAD
+            .decode(request.trim())
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("invalid pairing request: {e}"))?;
+    Ok(PairingRequestDetails {
+        identity: hex_bytes(value.get("identity")),
+        device_id: hex_bytes(value.pointer("/device/device_id")),
+        expires_at: value
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .ok_or("request expiry missing")?,
+    })
+}
+#[tauri::command]
+fn approve_pairing(app: tauri::AppHandle, request: String) -> Result<(), String> {
+    core(&app, &["pair-approve".into(), request]).map(|_| ())
+}
+#[tauri::command]
+fn consume_pairing(app: tauri::AppHandle) -> Result<(), String> {
+    core(&app, &["pair-consume".into()])?;
+    let mut account_index = index(&app)?;
+    let selected = account_index
+        .selected
+        .clone()
+        .ok_or("no pairing account selected")?;
+    let path = state_path(&app)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    if let Some(account) = account_index
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == selected)
+    {
+        account.identity = identity.clone();
+        account.label = format!("Account {}", &identity[..12]);
+    }
+    save_index(&app, &account_index)
+}
+#[tauri::command]
+fn cancel_pairing(app: tauri::AppHandle) -> Result<(), String> {
+    core(&app, &["pair-cancel".into()]).map(|_| ())
+}
+#[tauri::command]
 fn fetch_messages(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     core(&app, &["fetch".into()]).map(|output| output.lines().map(ToOwned::to_owned).collect())
 }
@@ -410,6 +565,21 @@ fn mark_read(app: tauri::AppHandle, conversation: String) -> Result<(), String> 
     )
     .map(|_| ())
 }
+#[tauri::command]
+fn revoke_device(app: tauri::AppHandle, device_id: String) -> Result<(), String> {
+    if account_status(app.clone())?
+        .devices
+        .iter()
+        .any(|device| device.id == device_id && device.current)
+    {
+        return Err("cannot revoke the current device from itself".into());
+    }
+    core(
+        &app,
+        &["revoke-device".into(), "--device-id".into(), device_id],
+    )
+    .map(|_| ())
+}
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -417,6 +587,17 @@ fn main() {
             let handle = app.handle().clone();
             thread::spawn(move || loop {
                 if let Ok(before) = account_status(handle.clone()) {
+                    // The protected relay operation is atomic fetch-and-consume. Retrying it
+                    // here is safe: before approval it changes nothing; after approval it
+                    // completes the local account exactly once and emits normal state.
+                    if !before.state_exists
+                        && before
+                            .pairing
+                            .as_ref()
+                            .is_some_and(|pairing| pairing.state == "waiting")
+                    {
+                        let _ = consume_pairing(handle.clone());
+                    }
                     if before.state_exists {
                         if let Err(error) = fetch_messages(handle.clone()) {
                             eprintln!("Pigeon background sync failed: {error}");
@@ -444,12 +625,18 @@ fn main() {
             configure_relay,
             migrate_relay,
             import_account,
+            begin_pairing,
+            pairing_request_details,
+            approve_pairing,
+            consume_pairing,
+            cancel_pairing,
             fetch_messages,
             send_direct,
             send_group,
             import_contact,
             share_card,
-            mark_read
+            mark_read,
+            revoke_device
         ])
         .run(tauri::generate_context!())
         .expect("run Pigeon");

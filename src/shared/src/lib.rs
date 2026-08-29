@@ -1,5 +1,9 @@
 use anyhow::Result;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hpke::{
+    aead::AesGcm128, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
+    Deserializable, OpModeR, OpModeS, Serializable,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -81,6 +85,215 @@ pub struct RelayForward {
     pub sender_relay: [u8; 32],
     pub signature: Vec<u8>,
 }
+pub const PAIRING_VERSION: u8 = 1;
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum PairingArtifactKind {
+    PublicRequest,
+    Approval,
+    EncryptedBootstrap,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PairingRelayArtifact {
+    pub version: u8,
+    pub identity: [u8; 32],
+    pub session_id: [u8; 16],
+    pub nonce: [u8; 16],
+    pub kind: PairingArtifactKind,
+    pub expires_at: i64,
+    pub capability_commitment: [u8; 32],
+    pub payload: Vec<u8>,
+}
+pub fn capability_commitment(capability: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(capability).into()
+}
+pub fn verify_pairing_artifact(a: &PairingRelayArtifact, now: i64) -> Result<()> {
+    if a.version != PAIRING_VERSION || a.expires_at <= now {
+        anyhow::bail!("invalid or expired pairing artifact")
+    }
+    Ok(())
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PairingRequest {
+    pub version: u8,
+    pub identity: [u8; 32],
+    pub session_id: [u8; 16],
+    pub nonce: [u8; 16],
+    pub expires_at: i64,
+    pub device: DeviceRecord,
+    pub hpke_public_key: [u8; 32],
+    /// Commitments keep both relay capabilities out of QR/copyable request text.
+    pub bootstrap_capability_commitment: [u8; 32],
+    pub cancel_capability_commitment: [u8; 32],
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PairingApproval {
+    pub version: u8,
+    pub identity: [u8; 32],
+    pub session_id: [u8; 16],
+    pub nonce: [u8; 16],
+    pub device: DeviceRecord,
+    pub roster_revision: u64,
+    pub roster_digest: [u8; 32],
+    pub expires_at: i64,
+    pub bootstrap_hash: [u8; 32],
+    pub bootstrap_capability_commitment: [u8; 32],
+    pub signature: Vec<u8>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PairingCancel {
+    pub version: u8,
+    pub identity: [u8; 32],
+    pub session_id: [u8; 16],
+    pub nonce: [u8; 16],
+    pub expires_at: i64,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BootstrapPayload {
+    pub version: u8,
+    pub root_secret: [u8; 32],
+    pub roster: AuthorizedDeviceSet,
+    pub routing: Option<RoutingRecord>,
+    pub contacts: Vec<ContactCard>,
+    pub control_state: Vec<u8>,
+    pub mls_bootstrap: Vec<Vec<u8>>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct EncryptedBootstrap {
+    pub version: u8,
+    pub encapsulated_key: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+fn pairing_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    bincode::serialize(value).expect("serializable pairing")
+}
+fn approval_bytes(a: &PairingApproval) -> Vec<u8> {
+    pairing_bytes(&(
+        a.version,
+        a.identity,
+        a.session_id,
+        a.nonce,
+        &a.device,
+        a.roster_revision,
+        a.roster_digest,
+        a.expires_at,
+        a.bootstrap_hash,
+        a.bootstrap_capability_commitment,
+    ))
+}
+pub fn verify_pairing_request(r: &PairingRequest, now: i64) -> Result<()> {
+    if r.version != PAIRING_VERSION || r.expires_at <= now || r.device.identity != r.identity {
+        anyhow::bail!("invalid or expired pairing request")
+    }
+    // A joining device does not yet possess the root key, so this is public
+    // device material rather than an already-authorized DeviceRecord. The
+    // approving device turns this exact material into a signed record.
+    if r.device.device_id != r.device.device_key || r.device.mls_key_package.is_empty() {
+        anyhow::bail!("invalid pairing device material")
+    }
+    Ok(())
+}
+pub fn authorize_pairing_device(
+    root: &SigningKey,
+    material: &DeviceRecord,
+    authorization_revision: u64,
+) -> DeviceRecord {
+    let mut device = material.clone();
+    device.identity = root.verifying_key().to_bytes();
+    device.device_id = device.device_key;
+    device.authorization_revision = authorization_revision;
+    device.signature = root.sign(&device_bytes(&device)).to_bytes().to_vec();
+    device
+}
+pub fn make_pairing_approval(
+    root: &SigningKey,
+    r: &PairingRequest,
+    roster: &AuthorizedDeviceSet,
+    bootstrap_hash: [u8; 32],
+) -> Result<PairingApproval> {
+    if roster.identity != r.identity
+        || !roster
+            .devices
+            .iter()
+            .any(|device| device.device_id == r.device.device_id)
+    {
+        anyhow::bail!("pairing approval roster does not contain requested device")
+    }
+    let device = roster
+        .devices
+        .iter()
+        .find(|device| device.device_id == r.device.device_id)
+        .expect("checked roster membership")
+        .clone();
+    let mut a = PairingApproval {
+        version: PAIRING_VERSION,
+        identity: r.identity,
+        session_id: r.session_id,
+        nonce: r.nonce,
+        device: device.clone(),
+        roster_revision: roster.revision,
+        roster_digest: Sha256::digest(pairing_bytes(roster)).into(),
+        expires_at: r.expires_at,
+        bootstrap_hash,
+        bootstrap_capability_commitment: r.bootstrap_capability_commitment,
+        signature: vec![0; 64],
+    };
+    a.signature = root.sign(&approval_bytes(&a)).to_bytes().to_vec();
+    Ok(a)
+}
+pub fn verify_pairing_approval(r: &PairingRequest, a: &PairingApproval, now: i64) -> Result<()> {
+    verify_pairing_request(r, now)?;
+    if a.version != PAIRING_VERSION
+        || a.expires_at <= now
+        || a.identity != r.identity
+        || a.session_id != r.session_id
+        || a.nonce != r.nonce
+        || a.device.device_id != r.device.device_id
+        || a.device.device_key != r.device.device_key
+        || a.device.mls_key_package != r.device.mls_key_package
+        || a.bootstrap_capability_commitment != r.bootstrap_capability_commitment
+    {
+        anyhow::bail!("pairing approval does not bind request")
+    }
+    verify_device(&a.device)?;
+    VerifyingKey::from_bytes(&a.identity)?
+        .verify(&approval_bytes(a), &signature(&a.signature)?)
+        .map_err(Into::into)
+}
+pub fn seal_bootstrap(r: &PairingRequest, p: &BootstrapPayload) -> Result<EncryptedBootstrap> {
+    let pk = <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(&r.hpke_public_key)?;
+    let (enc, mut ctx) = setup_sender::<AesGcm128, HkdfSha256, X25519HkdfSha256>(
+        &OpModeS::Base,
+        &pk,
+        &pairing_bytes(r),
+    )?;
+    Ok(EncryptedBootstrap {
+        version: PAIRING_VERSION,
+        encapsulated_key: enc.to_bytes().to_vec(),
+        ciphertext: ctx.seal(&pairing_bytes(p), &pairing_bytes(r))?,
+    })
+}
+pub fn open_bootstrap(
+    r: &PairingRequest,
+    secret: [u8; 32],
+    e: &EncryptedBootstrap,
+) -> Result<BootstrapPayload> {
+    if e.version != PAIRING_VERSION {
+        anyhow::bail!("unsupported bootstrap version")
+    }
+    let sk = <X25519HkdfSha256 as hpke::Kem>::PrivateKey::from_bytes(&secret)?;
+    let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&e.encapsulated_key)?;
+    let mut ctx = setup_receiver::<AesGcm128, HkdfSha256, X25519HkdfSha256>(
+        &OpModeR::Base,
+        &sk,
+        &enc,
+        &pairing_bytes(r),
+    )?;
+    let p: BootstrapPayload = bincode::deserialize(&ctx.open(&e.ciphertext, &pairing_bytes(r))?)?;
+    if p.version != PAIRING_VERSION {
+        anyhow::bail!("unsupported payload version")
+    }
+    Ok(p)
+}
 #[derive(Serialize, Deserialize, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Request {
@@ -121,6 +334,21 @@ pub enum Request {
         record_ids: Vec<i64>,
         signature: Vec<u8>,
     },
+    PublishPairingArtifact(PairingRelayArtifact),
+    FetchPairingRequest {
+        identity: [u8; 32],
+        session_id: [u8; 16],
+    },
+    FetchConsumePairingBootstrap {
+        identity: [u8; 32],
+        session_id: [u8; 16],
+        capability: [u8; 32],
+    },
+    CancelPairing {
+        identity: [u8; 32],
+        session_id: [u8; 16],
+        capability: [u8; 32],
+    },
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
@@ -132,6 +360,12 @@ pub enum Response {
     Moved(RoutingRecord),
     RelayDescriptor(RelayDescriptor),
     Error(String),
+    PairingArtifact(PairingRelayArtifact),
+    PairingNotFound,
+    PairingConsumed,
+    PairingCancelled,
+    PairingExpired,
+    PairingUnauthorized,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -589,5 +823,96 @@ mod tests {
             .try_into_protocol_message()
             .unwrap();
         assert!(a2.process_message(&provider_a2, old_state_message).is_err());
+    }
+
+    #[test]
+    fn pairing_approval_and_hpke_bootstrap_reject_all_bound_tampering() {
+        use hpke::Kem as _;
+        let root = SigningKey::generate(&mut rand_core::OsRng);
+        let device = SigningKey::generate(&mut rand_core::OsRng);
+        let record = make_device(&root, &device, vec![1, 2, 3]);
+        let (sk, pk) = X25519HkdfSha256::gen_keypair();
+        let request = PairingRequest {
+            version: PAIRING_VERSION,
+            identity: root.verifying_key().to_bytes(),
+            session_id: [1; 16],
+            nonce: [2; 16],
+            expires_at: 100,
+            device: record.clone(),
+            hpke_public_key: pk.to_bytes().into(),
+            bootstrap_capability_commitment: capability_commitment(&[3; 32]),
+            cancel_capability_commitment: capability_commitment(&[4; 32]),
+        };
+        verify_pairing_request(&request, 99).unwrap();
+        let payload = BootstrapPayload {
+            version: PAIRING_VERSION,
+            root_secret: root.to_bytes(),
+            roster: AuthorizedDeviceSet {
+                identity: request.identity,
+                revision: 2,
+                devices: vec![record.clone()],
+            },
+            routing: None,
+            contacts: vec![],
+            control_state: vec![9],
+            mls_bootstrap: vec![vec![8]],
+        };
+        let encrypted = seal_bootstrap(&request, &payload).unwrap();
+        let approval = make_pairing_approval(
+            &root,
+            &request,
+            &payload.roster,
+            Sha256::digest(pairing_bytes(&encrypted)).into(),
+        )
+        .unwrap();
+        verify_pairing_approval(&request, &approval, 99).unwrap();
+        assert_eq!(
+            open_bootstrap(&request, sk.to_bytes().into(), &encrypted)
+                .unwrap()
+                .root_secret,
+            root.to_bytes()
+        );
+
+        let mut forged = approval.clone();
+        forged.signature[0] ^= 1;
+        assert!(verify_pairing_approval(&request, &forged, 99).is_err());
+        for altered in [
+            PairingRequest {
+                identity: [3; 32],
+                ..request.clone()
+            },
+            PairingRequest {
+                session_id: [3; 16],
+                ..request.clone()
+            },
+            PairingRequest {
+                nonce: [3; 16],
+                ..request.clone()
+            },
+            PairingRequest {
+                expires_at: 98,
+                ..request.clone()
+            },
+        ] {
+            assert!(verify_pairing_approval(&altered, &approval, 99).is_err());
+        }
+        let mut wrong_device = request.clone();
+        wrong_device.device =
+            make_device(&root, &SigningKey::generate(&mut rand_core::OsRng), vec![4]);
+        assert!(verify_pairing_approval(&wrong_device, &approval, 99).is_err());
+        let mut changed = approval.clone();
+        changed.roster_revision += 1;
+        assert!(verify_pairing_approval(&request, &changed, 99).is_err());
+        let mut corrupt = encrypted.clone();
+        corrupt.ciphertext[0] ^= 1;
+        assert!(open_bootstrap(&request, sk.to_bytes().into(), &corrupt).is_err());
+        let (wrong_sk, _) = X25519HkdfSha256::gen_keypair();
+        assert!(open_bootstrap(&request, wrong_sk.to_bytes().into(), &encrypted).is_err());
+        let mut bad_version = request.clone();
+        bad_version.version = 2;
+        assert!(verify_pairing_request(&bad_version, 99).is_err());
+        let mut bad_payload = encrypted.clone();
+        bad_payload.ciphertext = vec![0];
+        assert!(open_bootstrap(&request, sk.to_bytes().into(), &bad_payload).is_err());
     }
 }
