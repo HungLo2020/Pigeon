@@ -52,8 +52,13 @@ def main() -> int:
     print(f"  TLS certificate: {certificate}")
     print(f"  TLS private key: {private_key}")
     print("  Stop with Ctrl+C. State is retained for the next run.")
+    build = ["cargo", "build", "-p", "pigeon-server"]
+    if subprocess.run(build, cwd=ROOT).returncode:
+        return 1
+    # Invoke the binary Cargo just built.  This makes the launcher's freshness
+    # contract explicit while retaining Cargo's normal incremental builds.
     return run([
-        "cargo", "run", "-p", "pigeon-server", "--",
+        str(ROOT / "target" / "debug" / "pigeon-server"),
         "--listen", args.listen,
         "--database", str(database),
         "--certificate", str(certificate),

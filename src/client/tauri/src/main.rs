@@ -1,5 +1,11 @@
-use serde::Serialize;
-use std::{path::PathBuf, process::Command, thread, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tauri::{Emitter, Manager};
 
 #[derive(Serialize, Clone)]
@@ -54,6 +60,20 @@ struct AccountStatus {
     devices: Vec<Device>,
     route: Option<Route>,
     messages: Vec<Message>,
+    accounts: Vec<AccountEntry>,
+    selected_account: Option<String>,
+    needs_relay: bool,
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct AccountEntry {
+    id: String,
+    label: String,
+    identity: String,
+}
+#[derive(Serialize, Deserialize, Default)]
+struct AccountIndex {
+    selected: Option<String>,
+    accounts: Vec<AccountEntry>,
 }
 
 fn unread_count(
@@ -93,11 +113,35 @@ fn hex_bytes(value: Option<&serde_json::Value>) -> String {
         .unwrap_or_default()
 }
 
+fn app_data(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map_err(|e| e.to_string())
+}
+fn index_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data(app)?.join("accounts.json"))
+}
+fn index(app: &tauri::AppHandle) -> Result<AccountIndex, String> {
+    let path = index_path(app)?;
+    if path.exists() {
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(AccountIndex::default())
+    }
+}
+fn save_index(app: &tauri::AppHandle, index: &AccountIndex) -> Result<(), String> {
+    let path = index_path(app)?;
+    fs::create_dir_all(path.parent().ok_or("missing app data parent")?)
+        .map_err(|e| e.to_string())?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
 fn state_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())
-        .map(|path| path.join("identity.json"))
+    let index = index(app)?;
+    let id = index.selected.ok_or("no local account selected")?;
+    Ok(app_data(app)?.join("accounts").join(format!("{id}.json")))
 }
 fn core(app: &tauri::AppHandle, arguments: &[String]) -> Result<String, String> {
     let state = state_path(app)?;
@@ -122,6 +166,23 @@ fn core(app: &tauri::AppHandle, arguments: &[String]) -> Result<String, String> 
 }
 #[tauri::command]
 fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
+    let account_index = index(&app)?;
+    if account_index.selected.is_none() {
+        return Ok(AccountStatus {
+            state_exists: false,
+            identity: None,
+            server: None,
+            contacts: vec![],
+            groups: vec![],
+            conversations: vec![],
+            devices: vec![],
+            route: None,
+            messages: vec![],
+            accounts: account_index.accounts,
+            selected_account: None,
+            needs_relay: false,
+        });
+    }
     let path = state_path(&app)?;
     if !path.exists() {
         return Ok(AccountStatus {
@@ -134,6 +195,9 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             devices: vec![],
             route: None,
             messages: vec![],
+            accounts: account_index.accounts,
+            selected_account: account_index.selected,
+            needs_relay: false,
         });
     }
     let value: serde_json::Value =
@@ -274,11 +338,91 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         devices,
         route,
         messages,
+        accounts: account_index.accounts,
+        selected_account: account_index.selected,
+        needs_relay: value.get("routing").is_none(),
     })
 }
 #[tauri::command]
-fn create_identity(app: tauri::AppHandle, server: String) -> Result<(), String> {
-    core(&app, &["create".into(), "--server".into(), server]).map(|_| ())
+fn create_account(app: tauri::AppHandle) -> Result<(), String> {
+    let id = format!(
+        "account-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    let path = app_data(&app)?.join("accounts").join(format!("{id}.json"));
+    fs::create_dir_all(path.parent().ok_or("missing account parent")?)
+        .map_err(|e| e.to_string())?;
+    let mut account_index = index(&app)?;
+    account_index.selected = Some(id.clone());
+    save_index(&app, &account_index)?;
+    core(&app, &["create-local".into()])?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    account_index.accounts.push(AccountEntry {
+        id,
+        label: format!("Account {}", &identity[..12]),
+        identity,
+    });
+    save_index(&app, &account_index)
+}
+#[tauri::command]
+fn select_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let mut account_index = index(&app)?;
+    if !account_index
+        .accounts
+        .iter()
+        .any(|account| account.id == id)
+    {
+        return Err("unknown local account".into());
+    };
+    account_index.selected = Some(id);
+    save_index(&app, &account_index)
+}
+#[tauri::command]
+fn configure_relay(app: tauri::AppHandle, server: String) -> Result<(), String> {
+    core(&app, &["configure-relay".into(), "--server".into(), server]).map(|_| ())
+}
+#[tauri::command]
+fn migrate_relay(app: tauri::AppHandle, server: String) -> Result<(), String> {
+    core(&app, &["migrate".into(), "--server".into(), server]).map(|_| ())
+}
+#[tauri::command]
+fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
+    let id = format!(
+        "account-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    let path = app_data(&app)?.join("accounts").join(format!("{id}.json"));
+    fs::create_dir_all(path.parent().ok_or("missing account parent")?)
+        .map_err(|e| e.to_string())?;
+    let mut account_index = index(&app)?;
+    let previous_selected = account_index.selected.clone();
+    account_index.selected = Some(id.clone());
+    save_index(&app, &account_index)?;
+    if let Err(error) = core(&app, &["import".into(), "--input".into(), backup]) {
+        account_index.selected = previous_selected;
+        save_index(&app, &account_index)?;
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    account_index.accounts.push(AccountEntry {
+        id,
+        label: format!("Account {}", &identity[..12]),
+        identity,
+    });
+    save_index(&app, &account_index)
 }
 #[tauri::command]
 fn fetch_messages(app: tauri::AppHandle) -> Result<Vec<String>, String> {
@@ -310,6 +454,7 @@ fn mark_read(app: tauri::AppHandle, conversation: String) -> Result<(), String> 
 }
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             thread::spawn(move || loop {
@@ -325,7 +470,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             account_status,
-            create_identity,
+            create_account,
+            select_account,
+            configure_relay,
+            migrate_relay,
+            import_account,
             fetch_messages,
             send_direct,
             send_group,

@@ -36,6 +36,8 @@ type PersistedMlsIdentity = (Vec<u8>, Vec<u8>, HashMap<String, String>);
 
 #[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    state_version: u8,
     signing_secret: [u8; 32],
     encryption_secret: [u8; 32],
     card: ContactCard,
@@ -92,9 +94,14 @@ struct Args {
     #[command(subcommand)]
     command: Command,
 }
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
+    CreateLocal,
     Create {
+        #[arg(long)]
+        server: String,
+    },
+    ConfigureRelay {
         #[arg(long)]
         server: String,
     },
@@ -161,7 +168,7 @@ fn load(path: &str) -> Result<State> {
     let state: State = serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read identity state {path}"))?,
     )?;
-    if state.routing.is_none() {
+    if state.routing.is_none() && state.state_version == 0 {
         bail!("legacy identity state has no versioned relay-bound routing record; re-import from a current backup")
     }
     Ok(state)
@@ -431,8 +438,12 @@ async fn deliver_group_payload(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let requested_create_server = match &args.command {
+        Command::Create { server } => Some(server.clone()),
+        _ => None,
+    };
     match args.command {
-        Command::Create { server } => {
+        Command::CreateLocal | Command::Create { .. } => {
             if std::path::Path::new(&args.state).exists() {
                 bail!("identity already exists: {}", args.state)
             };
@@ -446,6 +457,7 @@ async fn main() -> Result<()> {
             let (mls_key_package, mls_signer, mls_storage) =
                 create_mls_identity(&device_signing.verifying_key().to_bytes())?;
             let device = make_device(&signing, &device_signing, mls_key_package);
+            let server = requested_create_server.unwrap_or_default();
             let card = make_card(&signing, &encryption, server.clone(), device.clone());
             let authorized_devices = AuthorizedDeviceSet {
                 identity: identity_id(&card),
@@ -453,6 +465,7 @@ async fn main() -> Result<()> {
                 devices: vec![device.clone()],
             };
             let state = State {
+                state_version: 1,
                 signing_secret,
                 encryption_secret,
                 card: card.clone(),
@@ -470,6 +483,14 @@ async fn main() -> Result<()> {
                 history: vec![],
                 read_at: HashMap::new(),
             };
+            if server.is_empty() {
+                save(&args.state, &state)?;
+                println!(
+                    "identity created: {}",
+                    hex::encode(identity_id(&state.card))
+                );
+                return Ok(());
+            }
             response_ok(
                 request(
                     &server,
@@ -510,6 +531,47 @@ async fn main() -> Result<()> {
                 "export it with: pigeon-client --state {} export --output backup.json",
                 args.state
             );
+        }
+        Command::ConfigureRelay { server } => {
+            let mut state = load(&args.state)?;
+            if state.routing.is_some() {
+                bail!("identity already has a configured relay")
+            }
+            let signing = SigningKey::from_bytes(&state.signing_secret);
+            let encryption = StaticSecret::from(state.encryption_secret);
+            let card = make_card(&signing, &encryption, server.clone(), state.device.clone());
+            response_ok(
+                request(
+                    &server,
+                    &args.certificate,
+                    Request::Register {
+                        card: card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
+                )
+                .await?,
+            )?;
+            let descriptor = relay_descriptor(&server, &args.certificate).await?;
+            let route = make_routing(
+                &signing,
+                server,
+                descriptor.identity,
+                descriptor.tls_spki_fingerprint,
+                1,
+                0,
+            );
+            response_ok(
+                request(
+                    &route.server,
+                    &args.certificate,
+                    Request::PublishRouting(route.clone()),
+                )
+                .await?,
+            )?;
+            state.card = card;
+            state.routing = Some(route);
+            save(&args.state, &state)?;
         }
         Command::Export { output } => {
             let state = load(&args.state)?;

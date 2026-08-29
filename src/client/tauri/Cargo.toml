@@ -10,3 +10,4 @@ tauri-build = { version = "2.4", features = [] }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.9", features = [] }
+tauri-plugin-dialog = "2"
