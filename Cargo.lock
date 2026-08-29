@@ -3625,6 +3625,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bincode",
  "clap",
  "ed25519-dalek",
  "hex",

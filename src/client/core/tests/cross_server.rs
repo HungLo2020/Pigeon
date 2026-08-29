@@ -130,10 +130,6 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
             b.into(),
         ],
     ));
-    let alice_card = run(
-        &client_bin,
-        &["--state".into(), alice.display().to_string(), "card".into()],
-    );
     let bob_card = run(
         &client_bin,
         &["--state".into(), bob.display().to_string(), "card".into()],
@@ -149,18 +145,6 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
             bob_card,
         ],
     );
-    run(
-        &client_bin,
-        &[
-            "--state".into(),
-            bob.display().to_string(),
-            "--certificate".into(),
-            directory.join("a.der").display().to_string(),
-            "add-contact".into(),
-            alice_card,
-        ],
-    );
-
     run(
         &client_bin,
         &[

@@ -9,8 +9,8 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
     decode, encode, identity_id, make_card, make_card_with_devices, make_device, make_revocation,
-    make_routing, AuthorizedDeviceSet, ContactCard, DeviceRecord, DeviceRevocation,
-    RelayDescriptor, Request, Response, RoutingRecord,
+    make_routing, routing_precedes, AuthorizedDeviceSet, ContactCard, DeviceRecord,
+    DeviceRevocation, RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -33,6 +33,47 @@ use tokio_rustls::TlsConnector;
 use x25519_dalek::StaticSecret;
 
 type PersistedMlsIdentity = (Vec<u8>, Vec<u8>, HashMap<String, String>);
+const DISCOVERY_ENVELOPE_MAGIC: &[u8] = b"PIGEONMD";
+const DISCOVERY_ENVELOPE_VERSION: u8 = 1;
+
+/// Kept inside the relay-opaque MLS payload so that adding reciprocal contact
+/// discovery never changes the durable relay record format.  The recipient
+/// verifies every value before it reaches local contact/routing state.
+#[derive(Serialize, Deserialize)]
+struct DiscoveryEnvelope {
+    version: u8,
+    mls_payload: Vec<u8>,
+    sender_card: ContactCard,
+    sender_route: RoutingRecord,
+}
+
+fn wrap_mls_payload(state: &State, mls_payload: Vec<u8>) -> Result<Vec<u8>> {
+    let sender_route = state
+        .routing
+        .clone()
+        .context("cannot send MLS data before this account has a signed route")?;
+    let mut payload = DISCOVERY_ENVELOPE_MAGIC.to_vec();
+    payload.extend(bincode::serialize(&DiscoveryEnvelope {
+        version: DISCOVERY_ENVELOPE_VERSION,
+        mls_payload,
+        sender_card: state.card.clone(),
+        sender_route,
+    })?);
+    Ok(payload)
+}
+
+fn unwrap_mls_payload(payload: Vec<u8>) -> Result<(Vec<u8>, Option<DiscoveryEnvelope>)> {
+    if !payload.starts_with(DISCOVERY_ENVELOPE_MAGIC) {
+        // Existing relay-retained events predate discovery and are raw MLS.
+        return Ok((payload, None));
+    }
+    let envelope: DiscoveryEnvelope =
+        bincode::deserialize(&payload[DISCOVERY_ENVELOPE_MAGIC.len()..])?;
+    if envelope.version != DISCOVERY_ENVELOPE_VERSION {
+        bail!("unsupported MLS discovery envelope version")
+    }
+    Ok((envelope.mls_payload.clone(), Some(envelope)))
+}
 
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -46,6 +87,8 @@ struct State {
     /// account-local and is included in an identity export.
     mls_storage: HashMap<String, String>,
     mls_conversations: HashMap<String, Vec<u8>>,
+    #[serde(default)]
+    direct_groups: HashMap<String, String>,
     mls_signer: Vec<u8>,
     device: DeviceRecord,
     authorized_devices: AuthorizedDeviceSet,
@@ -79,6 +122,19 @@ fn message_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+fn should_replace_route(current: Option<&RoutingRecord>, candidate: &RoutingRecord) -> bool {
+    match current {
+        None => true,
+        Some(current) if candidate.revision > current.revision => true,
+        Some(current)
+            if candidate.revision == current.revision
+                && candidate.parent_revision == current.parent_revision =>
+        {
+            routing_precedes(candidate, current)
+        }
+        _ => false,
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct GroupState {
@@ -406,6 +462,7 @@ async fn deliver_group_payload(
     members: &[[u8; 32]],
     payload: Vec<u8>,
 ) -> Result<()> {
+    let payload = wrap_mls_payload(state, payload)?;
     for identity in members {
         if *identity == identity_id(&state.card) {
             continue;
@@ -472,6 +529,7 @@ async fn main() -> Result<()> {
                 contacts: vec![],
                 mls_storage,
                 mls_conversations: HashMap::new(),
+                direct_groups: HashMap::new(),
                 mls_signer,
                 device: device.clone(),
                 authorized_devices,
@@ -685,7 +743,7 @@ async fn main() -> Result<()> {
                                     .iter()
                                     .map(|device| device.device_id)
                                     .collect(),
-                                payload: welcome.to_bytes()?,
+                                payload: wrap_mls_payload(&state, welcome.to_bytes()?)?,
                             },
                         )?,
                     )
@@ -694,6 +752,9 @@ async fn main() -> Result<()> {
                 state
                     .mls_conversations
                     .insert(conversation.clone(), id.tls_serialize_detached()?);
+                state
+                    .direct_groups
+                    .insert(hex::encode(id.as_slice()), conversation.clone());
                 for device in &recipient.devices {
                     state
                         .mls_conversations
@@ -721,7 +782,7 @@ async fn main() -> Result<()> {
                                 .iter()
                                 .map(|device| device.device_id)
                                 .collect(),
-                            payload: message,
+                            payload: wrap_mls_payload(&state, message)?,
                         },
                     )?,
                 )
@@ -1006,7 +1067,7 @@ async fn main() -> Result<()> {
                                     .iter()
                                     .map(|device| device.device_id)
                                     .collect(),
-                                payload: payload.clone(),
+                                payload: wrap_mls_payload(&state, payload.clone())?,
                             }),
                         )
                         .await?,
@@ -1026,7 +1087,7 @@ async fn main() -> Result<()> {
                                 recipient_identity: identity_id(&state.card),
                                 sender_device: state.device.device_id,
                                 target_devices: local_targets,
-                                payload,
+                                payload: wrap_mls_payload(&state, payload)?,
                             }),
                         )
                         .await?,
@@ -1150,12 +1211,9 @@ async fn main() -> Result<()> {
                 if let Ok(Response::Routing(Some(route))) = route_response {
                     validate_route_descriptor(&route, &pinned_relay_descriptor(&route).await?)?;
                     let key = hex::encode(identity);
-                    let known = state
-                        .cached_routes
-                        .get(&key)
-                        .map(|route| route.revision)
-                        .unwrap_or(contact.revision);
-                    if route.identity == identity && route.revision > known {
+                    if route.identity == identity
+                        && should_replace_route(state.cached_routes.get(&key), &route)
+                    {
                         state.cached_routes.insert(key, route);
                     }
                 }
@@ -1215,7 +1273,46 @@ async fn main() -> Result<()> {
                         .use_ratchet_tree_extension(true)
                         .build();
                     for (_record_id, record) in records {
-                        let incoming = MlsMessageIn::tls_deserialize_exact(record.payload.clone())?;
+                        let (mls_payload, discovery) = unwrap_mls_payload(record.payload)?;
+                        if let Some(discovery) = discovery {
+                            let card = &discovery.sender_card;
+                            pigeon_shared::verify_card(card)?;
+                            if !card
+                                .devices
+                                .iter()
+                                .any(|device| device.device_id == record.sender_device)
+                            {
+                                bail!("sender contact card does not authorize MLS sender device")
+                            }
+                            let sender_identity = identity_id(card);
+                            if sender_identity == identity_id(&state.card) {
+                                bail!("received MLS record claims this account as sender")
+                            }
+                            match state
+                                .contacts
+                                .iter()
+                                .position(|contact| identity_id(contact) == sender_identity)
+                            {
+                                Some(index) if card.revision > state.contacts[index].revision => {
+                                    state.contacts[index] = card.clone();
+                                }
+                                None => state.contacts.push(card.clone()),
+                                _ => {}
+                            }
+                            let route = &discovery.sender_route;
+                            if route.identity != sender_identity || route.server != card.server {
+                                bail!("sender routing record does not match sender contact card")
+                            }
+                            validate_route_descriptor(
+                                route,
+                                &pinned_relay_descriptor(route).await?,
+                            )?;
+                            let route_key = hex::encode(sender_identity);
+                            if should_replace_route(state.cached_routes.get(&route_key), route) {
+                                state.cached_routes.insert(route_key, route.clone());
+                            }
+                        }
+                        let incoming = MlsMessageIn::tls_deserialize_exact(mls_payload.clone())?;
                         match incoming.extract() {
                             MlsMessageBodyIn::Welcome(welcome) => {
                                 let group = StagedWelcome::new_from_welcome(
@@ -1241,6 +1338,10 @@ async fn main() -> Result<()> {
                                     state
                                         .mls_conversations
                                         .insert(hex::encode(identity_id(contact)), group_id);
+                                    state.direct_groups.insert(
+                                        hex::encode(group.group_id().as_slice()),
+                                        hex::encode(identity_id(contact)),
+                                    );
                                 }
                                 let mut members = vec![identity_id(&state.card)];
                                 for contact in &state.contacts {
@@ -1267,7 +1368,7 @@ async fn main() -> Result<()> {
                             MlsMessageBodyIn::PrivateMessage(_)
                             | MlsMessageBodyIn::PublicMessage(_) => {
                                 let key = hex::encode(record.sender_device);
-                                let protocol = MlsMessageIn::tls_deserialize_exact(record.payload)?
+                                let protocol = MlsMessageIn::tls_deserialize_exact(mls_payload)?
                                     .try_into_protocol_message()?;
                                 let protocol_group = hex::encode(protocol.group_id().as_slice());
                                 let group_bytes = state
@@ -1282,10 +1383,11 @@ async fn main() -> Result<()> {
                                 let processed = group.process_message(&provider, protocol)?;
                                 match processed.into_content() {
                                     ProcessedMessageContent::ApplicationMessage(message) => {
-                                        let conversation = if state
-                                            .groups
-                                            .contains_key(&protocol_group)
+                                        let conversation = if let Some(contact) =
+                                            state.direct_groups.get(&protocol_group).cloned()
                                         {
+                                            contact
+                                        } else if state.groups.contains_key(&protocol_group) {
                                             format!("group:{protocol_group}")
                                         } else {
                                             state

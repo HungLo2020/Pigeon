@@ -2,3 +2,8 @@
 src/client/frontend/node_modules/
 src/client/frontend/dist/
 src/client/tauri/gen/
+
+# Local development relay/profile state and Python bytecode are runtime data.
+DevUtils/local-relay/
+DevUtils/profiles/
+DevUtils/__pycache__/

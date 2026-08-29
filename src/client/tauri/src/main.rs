@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
     process::Command,
@@ -227,7 +228,17 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .and_then(|v| v.as_object())
         .into_iter()
         .flatten()
-        .filter(|(id, _)| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .filter(|(id, group)| {
+            id.len() == 32
+                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                // Older direct Welcome handling persisted a group entry for a
+                // two-identity direct conversation. Never present that as a
+                // group chat.
+                && group
+                    .get("members")
+                    .and_then(|members| members.as_array())
+                    .is_some_and(|members| members.len() > 2)
+        })
         .map(|(id, group)| Group {
             id: id.clone(),
             members: group
@@ -264,7 +275,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             });
         }
     }
-    let messages: Vec<Message> = value
+    let mut messages: Vec<Message> = value
         .get("history")
         .and_then(|v| v.as_array())
         .into_iter()
@@ -278,6 +289,39 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             })
         })
         .collect();
+    // A direct chat is also an MLS group internally. Older persisted state
+    // recorded its canonical MLS group ID in `groups`; map that two-identity
+    // representation back to the verified contact conversation for UI/history
+    // purposes without changing MLS state or ownerless-group membership.
+    let direct_group_conversations: HashMap<String, String> = value
+        .get("groups")
+        .and_then(|groups| groups.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(group_id, group)| {
+            let members: Vec<String> = group
+                .get("members")?
+                .as_array()?
+                .iter()
+                .map(|member| hex_bytes(Some(member)))
+                .collect();
+            if members.len() != 2 {
+                return None;
+            }
+            let other = members
+                .iter()
+                .find(|member| Some(member.as_str()) != identity.as_deref())?;
+            contacts
+                .iter()
+                .any(|contact| contact.id == *other)
+                .then(|| (format!("group:{group_id}"), other.clone()))
+        })
+        .collect();
+    for message in &mut messages {
+        if let Some(conversation) = direct_group_conversations.get(&message.conversation) {
+            message.conversation = conversation.clone();
+        }
+    }
     let read_at = value
         .get("read_at")
         .and_then(|v| v.as_object())
@@ -458,10 +502,21 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             thread::spawn(move || loop {
-                if account_status(handle.clone()).is_ok() {
-                    let _ = fetch_messages(handle.clone());
+                if let Ok(before) = account_status(handle.clone()) {
+                    if before.state_exists {
+                        if let Err(error) = fetch_messages(handle.clone()) {
+                            eprintln!("Pigeon background sync failed: {error}");
+                            let _ = handle.emit("pigeon://sync-error", error);
+                        }
+                    }
                     if let Ok(status) = account_status(handle.clone()) {
-                        let _ = handle.emit("pigeon://state", status);
+                        // Avoid replacing the frontend DOM every polling cycle
+                        // when sync did not change account-visible state.
+                        if serde_json::to_string(&before).ok()
+                            != serde_json::to_string(&status).ok()
+                        {
+                            let _ = handle.emit("pigeon://state", status);
+                        }
                     }
                 }
                 thread::sleep(Duration::from_secs(8));
