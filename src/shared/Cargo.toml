@@ -17,3 +17,4 @@ openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = "0.5"
+x509-parser.workspace = true

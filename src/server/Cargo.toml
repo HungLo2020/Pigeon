@@ -13,3 +13,9 @@ rustls.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 pigeon-shared = { path = "../shared" }
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+x25519-dalek.workspace = true
+serde_json.workspace = true
