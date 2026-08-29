@@ -1,15 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs,
-    path::PathBuf,
-    process::Command,
-    thread,
+    fs, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
+mod account_store;
 mod state_mapping;
+use account_store::{app_data, core, index, save_index, state_path};
 use state_mapping::{hex_bytes, sort_conversations, unread_count};
 
 #[derive(Serialize, Clone)]
@@ -80,57 +79,6 @@ struct AccountIndex {
     accounts: Vec<AccountEntry>,
 }
 
-fn app_data(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|e| e.to_string())
-}
-fn index_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(app_data(app)?.join("accounts.json"))
-}
-fn index(app: &tauri::AppHandle) -> Result<AccountIndex, String> {
-    let path = index_path(app)?;
-    if path.exists() {
-        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())
-    } else {
-        Ok(AccountIndex::default())
-    }
-}
-fn save_index(app: &tauri::AppHandle, index: &AccountIndex) -> Result<(), String> {
-    let path = index_path(app)?;
-    fs::create_dir_all(path.parent().ok_or("missing app data parent")?)
-        .map_err(|e| e.to_string())?;
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
-}
-fn state_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let index = index(app)?;
-    let id = index.selected.ok_or("no local account selected")?;
-    Ok(app_data(app)?.join("accounts").join(format!("{id}.json")))
-}
-fn core(app: &tauri::AppHandle, arguments: &[String]) -> Result<String, String> {
-    let state = state_path(app)?;
-    if let Some(parent) = state.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut command =
-        Command::new(std::env::var("PIGEON_CLIENT_BIN").unwrap_or_else(|_| "pigeon-client".into()));
-    command.arg("--state").arg(state);
-    if let Ok(certificate) = std::env::var("PIGEON_CERTIFICATE") {
-        command.arg("--certificate").arg(certificate);
-    }
-    command.args(arguments);
-    let output = command
-        .output()
-        .map_err(|e| format!("start client core: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).into_owned())
-    }
-}
 #[tauri::command]
 fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
     let account_index = index(&app)?;
