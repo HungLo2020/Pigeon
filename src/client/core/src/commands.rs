@@ -2,11 +2,11 @@ use super::*;
 
 pub(super) async fn dispatch(args: Args) -> Result<()> {
     let requested_create_server = match &args.command {
-        Command::Create { server } => Some(server.clone()),
+        Command::Create { server, .. } => Some(server.clone()),
         _ => None,
     };
     match args.command {
-        Command::CreateLocal | Command::Create { .. } => {
+        Command::CreateLocal { display_name } | Command::Create { display_name, .. } => {
             if std::path::Path::new(&args.state).exists() {
                 bail!("identity already exists: {}", args.state)
             };
@@ -21,7 +21,16 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 create_mls_identity(&device_signing.verifying_key().to_bytes())?;
             let device = make_device(&signing, &device_signing, mls_key_package);
             let server = requested_create_server.unwrap_or_default();
-            let card = make_card(&signing, &encryption, server.clone(), device.clone());
+            if display_name.trim().is_empty() {
+                bail!("display name is required")
+            }
+            let card = make_card_named(
+                &signing,
+                &encryption,
+                server.clone(),
+                device.clone(),
+                display_name.trim().into(),
+            );
             let authorized_devices = AuthorizedDeviceSet {
                 identity: identity_id(&card),
                 revision: 1,
@@ -33,6 +42,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 encryption_secret,
                 card: card.clone(),
                 contacts: vec![],
+                nicknames: HashMap::new(),
                 mls_storage,
                 mls_conversations: HashMap::new(),
                 direct_groups: HashMap::new(),
@@ -269,12 +279,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             roster.revision = revision;
             roster.devices.push(provisional);
             verify_device_set(&roster)?;
-            let card = make_card_with_devices(
+            let card = make_card_with_devices_named(
                 &root,
                 &StaticSecret::from(state.encryption_secret),
                 state.card.server.clone(),
                 roster.devices.clone(),
                 state.card.revision + 1,
+                state.card.display_name.clone(),
             );
             let bootstrap = BootstrapPayload {
                 version: pigeon_shared::PAIRING_VERSION,
@@ -410,6 +421,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 encryption_secret: control.encryption_secret,
                 card: control.card,
                 contacts: bootstrap.contacts,
+                nicknames: HashMap::new(),
                 mls_storage: pending.mls_storage,
                 mls_conversations: HashMap::new(),
                 direct_groups: HashMap::new(),
@@ -459,6 +471,55 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             pending.cancelled = true;
             save_pairing(&pending_path, &pending)?;
             println!("pairing cancelled");
+        }
+        Command::SetDisplayName { display_name } => {
+            if display_name.trim().is_empty() {
+                bail!("display name is required")
+            }
+            let mut state = load(&args.state)?;
+            let root = SigningKey::from_bytes(&state.signing_secret);
+            state.card = make_card_with_devices_named(
+                &root,
+                &StaticSecret::from(state.encryption_secret),
+                state.card.server.clone(),
+                state.authorized_devices.devices.clone(),
+                state.card.revision + 1,
+                display_name.trim().into(),
+            );
+            response_ok(
+                request(
+                    &state.card.server,
+                    &args.certificate,
+                    Request::Register {
+                        card: state.card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
+                )
+                .await?,
+            )?;
+            save(&args.state, &state)?;
+        }
+        Command::SetNickname { identity, nickname } => {
+            let mut state = load(&args.state)?;
+            let identity = parse_identity(&identity)?;
+            if !state
+                .contacts
+                .iter()
+                .any(|card| identity_id(card) == identity)
+            {
+                bail!("unknown contact")
+            }
+            let key = hex::encode(identity);
+            match nickname.filter(|name| !name.trim().is_empty()) {
+                Some(name) => {
+                    state.nicknames.insert(key, name.trim().into());
+                }
+                None => {
+                    state.nicknames.remove(&key);
+                }
+            }
+            save(&args.state, &state)?;
         }
         Command::Card => println!("{}", card_text(&load(&args.state)?.card)?),
         Command::AddContact { card } => {
@@ -902,12 +963,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .devices
                 .retain(|device| device.device_id != device_id);
             state.authorized_devices.revision += 1;
-            state.card = make_card_with_devices(
+            state.card = make_card_with_devices_named(
                 &root,
                 &StaticSecret::from(state.encryption_secret),
                 state.card.server.clone(),
                 state.authorized_devices.devices.clone(),
                 state.card.revision + 1,
+                state.card.display_name.clone(),
             );
             save(&args.state, &state)?;
             println!("device revoked");
@@ -927,12 +989,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .as_ref()
                 .map(|route| route.revision)
                 .unwrap_or(state.card.revision);
-            let card = make_card_with_devices(
+            let card = make_card_with_devices_named(
                 &root,
                 &StaticSecret::from(state.encryption_secret),
                 server.clone(),
                 state.authorized_devices.devices.clone(),
                 state.card.revision + 1,
+                state.card.display_name.clone(),
             );
             // Register first: a route is never published to a destination that
             // has not accepted the identity/device records.
@@ -1259,12 +1322,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                         bail!("received stale or unrelated MOVED record")
                     }
                     let root = SigningKey::from_bytes(&state.signing_secret);
-                    state.card = make_card_with_devices(
+                    state.card = make_card_with_devices_named(
                         &root,
                         &StaticSecret::from(state.encryption_secret),
                         route.server.clone(),
                         state.authorized_devices.devices.clone(),
                         route.revision,
+                        state.card.display_name.clone(),
                     );
                     state.routing = Some(route);
                     save(&args.state, &state)?;

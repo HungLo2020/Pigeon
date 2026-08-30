@@ -16,6 +16,8 @@ use state_mapping::{hex_bytes, sort_conversations, unread_count};
 struct Contact {
     id: String,
     server: String,
+    display_name: String,
+    nickname: Option<String>,
 }
 #[derive(Serialize, Clone)]
 struct Group {
@@ -69,6 +71,8 @@ struct AccountStatus {
     selected_account: Option<String>,
     needs_relay: bool,
     pairing: Option<PairingStatus>,
+    appearance: String,
+    display_name: Option<String>,
 }
 #[derive(Serialize, Clone)]
 struct PairingStatus {
@@ -94,6 +98,11 @@ struct AccountEntry {
 struct AccountIndex {
     selected: Option<String>,
     accounts: Vec<AccountEntry>,
+    #[serde(default = "default_appearance")]
+    appearance: String,
+}
+fn default_appearance() -> String {
+    "system".into()
 }
 
 #[tauri::command]
@@ -114,6 +123,8 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             selected_account: None,
             needs_relay: false,
             pairing: None,
+            appearance: account_index.appearance,
+            display_name: None,
         });
     }
     let path = state_path(&app)?;
@@ -132,6 +143,8 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             selected_account: account_index.selected,
             needs_relay: false,
             pairing: pairing_status(&app).ok().flatten(),
+            appearance: account_index.appearance,
+            display_name: None,
         });
     }
     let value: serde_json::Value =
@@ -153,6 +166,16 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             Some(Contact {
                 id: hex_bytes(card.get("signing_key")),
                 server: card.get("server")?.as_str()?.to_owned(),
+                display_name: card
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unnamed")
+                    .to_owned(),
+                nickname: value
+                    .get("nicknames")
+                    .and_then(|n| n.get(hex_bytes(card.get("signing_key"))))
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
             })
         })
         .collect();
@@ -268,7 +291,10 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .map(|contact| {
             (
                 contact.id.clone(),
-                contact.id[..12.min(contact.id.len())].to_owned(),
+                contact
+                    .nickname
+                    .clone()
+                    .unwrap_or_else(|| contact.display_name.clone()),
                 "direct".to_owned(),
             )
         })
@@ -322,6 +348,12 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         selected_account: account_index.selected,
         needs_relay: value.get("routing").is_none(),
         pairing: pairing_status(&app).ok().flatten(),
+        appearance: account_index.appearance,
+        display_name: value
+            .get("card")
+            .and_then(|c| c.get("display_name"))
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -368,7 +400,7 @@ fn pairing_status(app: &tauri::AppHandle) -> Result<Option<PairingStatus>, Strin
     }))
 }
 #[tauri::command]
-fn create_account(app: tauri::AppHandle) -> Result<(), String> {
+fn create_account(app: tauri::AppHandle, display_name: String) -> Result<(), String> {
     let id = format!(
         "account-{}",
         SystemTime::now()
@@ -382,16 +414,67 @@ fn create_account(app: tauri::AppHandle) -> Result<(), String> {
     let mut account_index = index(&app)?;
     account_index.selected = Some(id.clone());
     save_index(&app, &account_index)?;
-    core(&app, &["create-local".into()])?;
+    core(
+        &app,
+        &["create-local".into(), "--display-name".into(), display_name],
+    )?;
     let value: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let identity = hex_bytes(value.pointer("/card/signing_key"));
     account_index.accounts.push(AccountEntry {
         id,
-        label: format!("Account {}", &identity[..12]),
+        label: value
+            .pointer("/card/display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unnamed")
+            .to_owned(),
         identity,
     });
+    save_index(&app, &account_index)
+}
+#[tauri::command]
+fn set_display_name(app: tauri::AppHandle, display_name: String) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "set-display-name".into(),
+            "--display-name".into(),
+            display_name.clone(),
+        ],
+    )?;
+    let mut account_index = index(&app)?;
+    if let Some(selected) = &account_index.selected {
+        if let Some(account) = account_index
+            .accounts
+            .iter_mut()
+            .find(|account| &account.id == selected)
+        {
+            account.label = display_name;
+        }
+    }
+    save_index(&app, &account_index)
+}
+#[tauri::command]
+fn set_nickname(
+    app: tauri::AppHandle,
+    identity: String,
+    nickname: Option<String>,
+) -> Result<(), String> {
+    let mut args = vec!["set-nickname".into(), "--identity".into(), identity];
+    if let Some(nickname) = nickname {
+        args.push("--nickname".into());
+        args.push(nickname);
+    }
+    core(&app, &args).map(|_| ())
+}
+#[tauri::command]
+fn set_appearance(app: tauri::AppHandle, appearance: String) -> Result<(), String> {
+    if !matches!(appearance.as_str(), "system" | "light" | "dark") {
+        return Err("appearance must be System, Light, or Dark".into());
+    }
+    let mut account_index = index(&app)?;
+    account_index.appearance = appearance;
     save_index(&app, &account_index)
 }
 #[tauri::command]
@@ -443,7 +526,11 @@ fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
     let identity = hex_bytes(value.pointer("/card/signing_key"));
     account_index.accounts.push(AccountEntry {
         id,
-        label: format!("Account {}", &identity[..12]),
+        label: value
+            .pointer("/card/display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unnamed")
+            .to_owned(),
         identity,
     });
     save_index(&app, &account_index)
@@ -621,6 +708,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             account_status,
             create_account,
+            set_display_name,
+            set_nickname,
+            set_appearance,
             select_account,
             configure_relay,
             migrate_relay,

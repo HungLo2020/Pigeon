@@ -61,11 +61,15 @@ pub struct RelayDescriptor {
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ContactCard {
+    #[serde(default)]
+    pub profile_version: u8,
     pub signing_key: [u8; 32],
     pub encryption_key: [u8; 32],
     pub server: String,
     pub revision: u64,
     pub devices: Vec<DeviceRecord>,
+    #[serde(default)]
+    pub display_name: String,
     pub signature: Vec<u8>,
 }
 /// Opaque MLS wire data. The relay validates routing metadata only; it never
@@ -376,7 +380,29 @@ struct UnsignedCard {
     revision: u64,
     devices: Vec<DeviceRecord>,
 }
+#[derive(Serialize)]
+struct UnsignedProfileCard {
+    profile_version: u8,
+    signing_key: [u8; 32],
+    encryption_key: [u8; 32],
+    server: String,
+    revision: u64,
+    devices: Vec<DeviceRecord>,
+    display_name: String,
+}
 fn card_bytes(card: &ContactCard) -> Vec<u8> {
+    if card.profile_version >= 1 {
+        return bincode::serialize(&UnsignedProfileCard {
+            profile_version: card.profile_version,
+            signing_key: card.signing_key,
+            encryption_key: card.encryption_key,
+            server: card.server.clone(),
+            revision: card.revision,
+            devices: card.devices.clone(),
+            display_name: card.display_name.clone(),
+        })
+        .expect("serializable profile card");
+    }
     bincode::serialize(&UnsignedCard {
         signing_key: card.signing_key,
         encryption_key: card.encryption_key,
@@ -562,12 +588,23 @@ pub fn make_card(
     server: String,
     device: DeviceRecord,
 ) -> ContactCard {
+    make_card_named(signing, encryption, server, device, "Unnamed".into())
+}
+pub fn make_card_named(
+    signing: &SigningKey,
+    encryption: &StaticSecret,
+    server: String,
+    device: DeviceRecord,
+    display_name: String,
+) -> ContactCard {
     let mut card = ContactCard {
+        profile_version: 1,
         signing_key: signing.verifying_key().to_bytes(),
         encryption_key: PublicKey::from(encryption).to_bytes(),
         server,
         revision: 1,
         devices: vec![device],
+        display_name,
         signature: vec![0; 64],
     };
     card.signature = signing.sign(&card_bytes(&card)).to_bytes().to_vec();
@@ -581,18 +618,43 @@ pub fn make_card_with_devices(
     devices: Vec<DeviceRecord>,
     revision: u64,
 ) -> ContactCard {
+    make_card_with_devices_named(
+        signing,
+        encryption,
+        server,
+        devices,
+        revision,
+        "Unnamed".into(),
+    )
+}
+pub fn make_card_with_devices_named(
+    signing: &SigningKey,
+    encryption: &StaticSecret,
+    server: String,
+    devices: Vec<DeviceRecord>,
+    revision: u64,
+    display_name: String,
+) -> ContactCard {
     let mut card = ContactCard {
+        profile_version: 1,
         signing_key: signing.verifying_key().to_bytes(),
         encryption_key: PublicKey::from(encryption).to_bytes(),
         server,
         revision,
         devices,
+        display_name,
         signature: vec![0; 64],
     };
     card.signature = signing.sign(&card_bytes(&card)).to_bytes().to_vec();
     card
 }
 pub fn verify_card(card: &ContactCard) -> Result<()> {
+    if card.profile_version > 1
+        || (card.profile_version == 1
+            && (card.display_name.trim().is_empty() || card.display_name.chars().count() > 64))
+    {
+        anyhow::bail!("invalid contact profile display name")
+    }
     VerifyingKey::from_bytes(&card.signing_key)?
         .verify(&card_bytes(card), &signature(&card.signature)?)?;
     for device in &card.devices {

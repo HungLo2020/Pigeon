@@ -8,12 +8,12 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
-    capability_commitment, decode, encode, identity_id, make_card, make_card_with_devices,
-    make_device, make_pairing_approval, make_revocation, make_routing, open_bootstrap,
-    seal_bootstrap, verify_device_set, verify_pairing_approval, verify_pairing_request,
-    AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord, DeviceRevocation,
-    EncryptedBootstrap, PairingApproval, PairingArtifactKind, PairingRelayArtifact, PairingRequest,
-    RelayDescriptor, Request, Response, RoutingRecord,
+    capability_commitment, decode, encode, identity_id, make_card, make_card_named,
+    make_card_with_devices_named, make_device, make_pairing_approval, make_revocation,
+    make_routing, open_bootstrap, seal_bootstrap, verify_device_set, verify_pairing_approval,
+    verify_pairing_request, AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord,
+    DeviceRevocation, EncryptedBootstrap, PairingApproval, PairingArtifactKind,
+    PairingRelayArtifact, PairingRequest, RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -50,6 +50,8 @@ struct State {
     encryption_secret: [u8; 32],
     card: ContactCard,
     contacts: Vec<ContactCard>,
+    #[serde(default)]
+    nicknames: HashMap<String, String>,
     /// Serialized OpenMLS provider storage and conversation metadata. This is
     /// account-local and is included in an identity export.
     mls_storage: HashMap<String, String>,
@@ -118,10 +120,15 @@ struct Args {
 }
 #[derive(Subcommand, Clone)]
 enum Command {
-    CreateLocal,
+    CreateLocal {
+        #[arg(long, default_value = "Unnamed")]
+        display_name: String,
+    },
     Create {
         #[arg(long)]
         server: String,
+        #[arg(long, default_value = "Unnamed")]
+        display_name: String,
     },
     ConfigureRelay {
         #[arg(long)]
@@ -136,6 +143,16 @@ enum Command {
         input: String,
     },
     Card,
+    SetDisplayName {
+        #[arg(long)]
+        display_name: String,
+    },
+    SetNickname {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        nickname: Option<String>,
+    },
     AddContact {
         card: String,
     },
