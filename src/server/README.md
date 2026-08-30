@@ -42,3 +42,21 @@ The server may be authoritative for recent delivery, synchronization, observed a
 - become the permanent canonical history store
 
 Server addresses are mutable routing metadata. A user moving to another server remains the same cryptographic identity.
+
+## Debian relay deployment
+
+The `pigeon-server` Debian package installs the relay binary, `pigeon-setup`,
+and a disabled `pigeon-server.service` unit. Package installation creates the
+non-login `pigeon` service account but does not expose a partially configured
+listener. Run `sudo pigeon-setup` to select the bind/public addresses and TLS
+material. It writes `/etc/pigeon/pigeon-server.conf`, keeps the SQLite database,
+relay identity, and TLS material under `/var/lib/pigeon`, initializes the relay
+as the `pigeon` account, and then enables the service.
+
+The daemon also supports `--config PATH` for an explicit key/value config and
+`--initialize-only` for setup tooling. Existing development CLI flags remain
+available. Relay logs use the normal systemd journal:
+
+```bash
+journalctl -u pigeon-server -f
+```

@@ -82,3 +82,28 @@ The client core should remain independent of Tauri so communication, identity, c
 Pigeon is currently in the architecture and protocol-design phase.
 
 See [PROJECT.md](PROJECT.md) for the project requirements and architecture.
+
+## CI and rolling packages
+
+GitHub Actions builds the actual Tauri application from
+`src/client/tauri/tauri.conf.json`. `CI` runs on pushes and pull requests for
+`main`, including the locked frontend build, Rust checks, and two independent
+Debian packages. `pigeon-client` contains the Tauri desktop client and its
+desktop runtime dependencies; `pigeon-server` contains only the relay binary
+and is validated to exclude Tauri, WebKit, and frontend assets. Both packages
+share one workspace version and source commit, but can be built independently
+through `DevUtils/build_debian_packages.py --client` or `--server`.
+
+Installing `pigeon-server` creates a non-login `pigeon` account and the
+`pigeon-server` systemd unit, but does not enable it. Run `sudo pigeon-setup`
+to choose the listener/public address and TLS material, initialize persistent
+state below `/var/lib/pigeon`, write `/etc/pigeon/pigeon-server.conf`, and then
+enable the relay. The package never stores mutable state below `/usr`; relay
+logs are available through `journalctl -u pigeon-server`.
+
+After successful main-branch CI, `Release latest` replaces the rolling
+`latest` release/tag with both packages and one `SHA256SUMS` file. `Debian
+package release` is manually dispatched and similarly replaces the independent
+`debian` release/tag. The manually dispatched iOS workflow remains client-only:
+it validates the intended macOS/Tauri build inputs without requiring signing or
+publishing an IPA.

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+fi
+
+# Never remove /etc/pigeon or /var/lib/pigeon: both are administrator-owned
+# persistent state and must survive package removal/upgrades.
+exit 0

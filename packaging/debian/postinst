@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+  configure)
+    if ! getent group pigeon >/dev/null 2>&1; then
+      addgroup --system pigeon
+    fi
+    if ! getent passwd pigeon >/dev/null 2>&1; then
+      adduser --system --ingroup pigeon --home /var/lib/pigeon \
+        --no-create-home --shell /usr/sbin/nologin pigeon
+    fi
+    install -d -o pigeon -g pigeon -m 0750 /var/lib/pigeon
+    install -d -o root -g pigeon -m 0750 /etc/pigeon
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+# Deliberately do not enable or start the relay here. pigeon-setup writes a
+# complete persistent configuration and performs that transition explicitly.
+
+exit 0

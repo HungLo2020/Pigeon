@@ -1,0 +1,54 @@
+name: iOS build path scaffold
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios-path:
+    name: Validate iOS build prerequisites
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust and iOS targets
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/client/frontend/package-lock.json
+
+      - name: Install and build the shared frontend
+        run: |
+          npm ci --prefix src/client/frontend
+          npm run build --prefix src/client/frontend
+
+      - name: Install the locked Tauri CLI
+        run: cargo install tauri-cli --version 2.11.0 --locked
+
+      - name: Validate the future iOS build inputs
+        run: |
+          set -euo pipefail
+          cargo tauri --version
+          test -f src/client/tauri/tauri.conf.json
+          test -f resources/pigeon.svg
+          cat <<'EOF'
+          Pigeon does not yet commit a generated Tauri Apple project or signing
+          configuration. The intended unsigned development path is:
+
+            cargo tauri ios init --config src/client/tauri/tauri.conf.json
+            cargo tauri ios build --target aarch64-sim --config src/client/tauri/tauri.conf.json
+
+          This scaffold intentionally performs no signing, provisioning,
+          TestFlight upload, or IPA release. It is manually dispatched so it
+          cannot block Linux CI or the rolling latest release.
+          EOF

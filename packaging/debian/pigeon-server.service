@@ -1,0 +1,24 @@
+[Unit]
+Description=Pigeon encrypted-message relay
+Documentation=https://github.com/pigeon-chat/pigeon
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pigeon/pigeon-server.conf
+
+[Service]
+Type=simple
+User=pigeon
+Group=pigeon
+ExecStart=/usr/bin/pigeon-server --config /etc/pigeon/pigeon-server.conf
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+StateDirectory=pigeon
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

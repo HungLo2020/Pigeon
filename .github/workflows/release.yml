@@ -1,0 +1,124 @@
+name: Release latest
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latest-release
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Require successful CI
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Record the CI-tested commit
+        id: source
+        run: echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build tested Debian package
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Check out CI-tested source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.source_sha }}
+
+      - name: Verify the checked-out commit
+        id: source
+        env:
+          SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            dpkg-dev \
+            pkg-config \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Select stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/client/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix src/client/frontend
+
+      - name: Build frontend
+        run: npm run build --prefix src/client/frontend
+
+      - name: Install the locked Tauri CLI
+        run: cargo install tauri-cli --version 2.11.0 --locked
+
+      - name: Build and validate client and relay Debian packages
+        run: |
+          set -euo pipefail
+          python3 DevUtils/build_debian_packages.py --output release
+          mkdir -p release
+          sha256sum release/pigeon-client_*.deb release/pigeon-server_*.deb > release/SHA256SUMS
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pigeon-latest-debian
+          path: release/
+          if-no-files-found: error
+
+  release:
+    name: Replace latest GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Debian package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pigeon-latest-debian
+          path: release-assets
+
+      - name: Replace rolling latest release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title latest \
+            --notes "Automated latest build for CI-tested commit ${SOURCE_SHA}." \
+            release-assets/pigeon-client_*.deb \
+            release-assets/pigeon-server_*.deb \
+            release-assets/SHA256SUMS

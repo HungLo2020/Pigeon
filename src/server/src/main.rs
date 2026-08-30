@@ -14,6 +14,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, ServerConfig, SignatureScheme,
 };
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,21 +24,62 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+mod config;
 mod tls;
 mod transport;
+use config::ServerSettings;
 use tls::ensure_certificate;
 use transport::{read_frame, write_frame};
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8443")]
-    listen: String,
-    #[arg(long, default_value = "pigeon-server.sqlite3")]
-    database: String,
-    #[arg(long, default_value = "pigeon-server-cert.der")]
-    certificate: String,
-    #[arg(long, default_value = "pigeon-server-key.der")]
-    private_key: String,
+    /// Persistent key=value relay configuration, normally /etc/pigeon/pigeon-server.conf.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    listen: Option<String>,
+    #[arg(long)]
+    public_address: Option<String>,
+    #[arg(long)]
+    database: Option<String>,
+    #[arg(long)]
+    certificate: Option<String>,
+    #[arg(long)]
+    private_key: Option<String>,
+    /// Initialize persistent TLS/relay/database state and exit without binding a socket.
+    #[arg(long)]
+    initialize_only: bool,
+}
+
+impl Args {
+    fn settings(&self) -> Result<ServerSettings> {
+        let uses_legacy_defaults = self.config.is_none();
+        let mut settings = match &self.config {
+            Some(path) => ServerSettings::from_config(path)?,
+            None => ServerSettings::default(),
+        };
+        if let Some(value) = &self.listen {
+            settings.listen = value.clone();
+        }
+        if let Some(value) = &self.public_address {
+            settings.public_address = value.clone();
+        } else if uses_legacy_defaults && self.listen.is_some() {
+            // Before packaged config existed, --listen was also the published
+            // route. Preserve that CLI behavior for development callers.
+            settings.public_address = settings.listen.clone();
+        }
+        if let Some(value) = &self.database {
+            settings.database = value.clone();
+        }
+        if let Some(value) = &self.certificate {
+            settings.certificate = value.clone();
+        }
+        if let Some(value) = &self.private_key {
+            settings.private_key = value.clone();
+        }
+        settings.validate()?;
+        Ok(settings)
+    }
 }
 
 const DORMANCY_SECONDS: i64 = 90 * 24 * 60 * 60;
@@ -52,7 +94,8 @@ use runtime::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (cert, key) = ensure_certificate(&args.certificate, &args.private_key)?;
+    let settings = args.settings()?;
+    let (cert, key) = ensure_certificate(&settings.certificate, &settings.private_key)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
@@ -60,10 +103,17 @@ async fn main() -> Result<()> {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
         )
         .context("invalid TLS certificate")?;
-    let database = Connection::open(&args.database)?;
+    let database = Connection::open(&settings.database)?;
     initialize(&database)?;
     bind_relay_tls_spki(&database, tls_spki_fingerprint(&cert)?)?;
-    set_relay_address(&database, &args.listen)?;
+    set_relay_address(&database, &settings.public_address)?;
+    if args.initialize_only {
+        eprintln!(
+            "pigeon relay state initialized for {}",
+            settings.public_address
+        );
+        return Ok(());
+    }
     let database = Arc::new(Mutex::new(database));
     let lifecycle_database = database.clone();
     tokio::spawn(async move {
@@ -92,13 +142,34 @@ async fn main() -> Result<()> {
             }
         }
     });
-    let listener = TcpListener::bind(&args.listen).await?;
-    eprintln!("pigeon relay listening on {}", args.listen);
+    let listener = TcpListener::bind(&settings.listen).await?;
+    eprintln!("pigeon relay listening on {}", settings.listen);
     let acceptor = TlsAcceptor::from(Arc::new(config));
     loop {
         let (stream, _) = listener.accept().await?;
         if let Err(error) = handle(stream, acceptor.clone(), database.clone()).await {
             eprintln!("connection rejected: {error:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Args;
+
+    #[test]
+    fn direct_cli_listen_remains_the_default_public_address() {
+        let args = Args {
+            config: None,
+            listen: Some("127.0.0.1:9443".into()),
+            public_address: None,
+            database: None,
+            certificate: None,
+            private_key: None,
+            initialize_only: false,
+        };
+        let settings = args.settings().unwrap();
+        assert_eq!(settings.listen, "127.0.0.1:9443");
+        assert_eq!(settings.public_address, "127.0.0.1:9443");
     }
 }

@@ -1,0 +1,107 @@
+name: Debian package release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: debian-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Debian package
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Record the exact source commit
+        id: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            dpkg-dev \
+            pkg-config \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Select stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/client/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix src/client/frontend
+
+      - name: Build frontend
+        run: npm run build --prefix src/client/frontend
+
+      - name: Install the locked Tauri CLI
+        run: cargo install tauri-cli --version 2.11.0 --locked
+
+      - name: Build and validate client and relay Debian packages
+        run: |
+          set -euo pipefail
+          python3 DevUtils/build_debian_packages.py --output release
+          mkdir -p release
+          sha256sum release/pigeon-client_*.deb release/pigeon-server_*.deb > release/SHA256SUMS
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pigeon-debian
+          path: release/
+          if-no-files-found: error
+
+  release:
+    name: Replace dedicated Debian release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Debian package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pigeon-debian
+          path: release-assets
+
+      - name: Replace dedicated Debian release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh release delete debian --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create debian \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title debian \
+            --notes "Automated Debian package for ${SOURCE_SHA}. This release is independent of latest." \
+            release-assets/pigeon-client_*.deb \
+            release-assets/pigeon-server_*.deb \
+            release-assets/SHA256SUMS
