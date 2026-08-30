@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -45,6 +46,21 @@ fn wait_for(path: &Path) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("relay did not create {}", path.display());
+}
+
+fn wait_for_relay(relay: &mut Child, address: &str, certificate: &Path) {
+    wait_for(certificate);
+    let address: SocketAddr = address.parse().expect("test relay socket address");
+    for _ in 0..100 {
+        if let Some(status) = relay.try_wait().expect("inspect relay process") {
+            panic!("relay exited before accepting connections: {status}");
+        }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(25)).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("relay did not accept connections at {address}");
 }
 
 fn id(output: &str) -> String {
@@ -98,8 +114,7 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
     let address = "127.0.0.1:39420";
     let mut relay = server(&server_bin, address, &directory, "pairing");
     let certificate = directory.join("pairing.der");
-    wait_for(&certificate);
-    thread::sleep(Duration::from_millis(150));
+    wait_for_relay(&mut relay, address, &certificate);
     let existing = directory.join("existing.json");
     let joining = directory.join("joining.json");
     let root_id = id(&run(
@@ -129,7 +144,7 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
     let _ = relay.kill();
     let _ = relay.wait();
     relay = server(&server_bin, address, &directory, "pairing");
-    thread::sleep(Duration::from_millis(150));
+    wait_for_relay(&mut relay, address, &certificate);
     run(
         &client_bin,
         &client_args(
@@ -207,10 +222,8 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
     let c = "127.0.0.1:39403";
     let mut relay_a = server(&server_bin, a, &directory, "a");
     let mut relay_b = server(&server_bin, b, &directory, "b");
-    wait_for(&directory.join("a.der"));
-    wait_for(&directory.join("b.der"));
-    // Certificate persistence precedes listener bind by a small amount.
-    thread::sleep(Duration::from_millis(150));
+    wait_for_relay(&mut relay_a, a, &directory.join("a.der"));
+    wait_for_relay(&mut relay_b, b, &directory.join("b.der"));
     let alice = directory.join("alice.json");
     let bob = directory.join("bob.json");
     let alice_id = id(&run(
@@ -286,7 +299,8 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
     relay_b.wait().unwrap();
     relay_a = server(&server_bin, a, &directory, "a");
     relay_b = server(&server_bin, b, &directory, "b");
-    thread::sleep(Duration::from_millis(300));
+    wait_for_relay(&mut relay_a, a, &directory.join("a.der"));
+    wait_for_relay(&mut relay_b, b, &directory.join("b.der"));
     run(
         &client_bin,
         &[
@@ -314,7 +328,7 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
     .contains("after restart"));
 
     let mut relay_c = server(&server_bin, c, &directory, "c");
-    wait_for(&directory.join("c.der"));
+    wait_for_relay(&mut relay_c, c, &directory.join("c.der"));
     // Bob signs and publishes B -> C before C becomes its local route. Alice
     // retains B until normal pinned sync learns the signed newer revision.
     run(
@@ -407,10 +421,9 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
     let mut relay_a = server(&server_bin, a, &directory, "a");
     let mut relay_b = server(&server_bin, b, &directory, "b");
     let mut relay_c = server(&server_bin, c, &directory, "c");
-    for name in ["a.der", "b.der", "c.der"] {
-        wait_for(&directory.join(name));
-    }
-    thread::sleep(Duration::from_millis(150));
+    wait_for_relay(&mut relay_a, a, &directory.join("a.der"));
+    wait_for_relay(&mut relay_b, b, &directory.join("b.der"));
+    wait_for_relay(&mut relay_c, c, &directory.join("c.der"));
     let alice = directory.join("alice.json");
     let bob = directory.join("bob.json");
     let carol = directory.join("carol.json");
@@ -563,7 +576,7 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
     relay_a.kill().unwrap();
     relay_a.wait().unwrap();
     relay_a = server(&server_bin, a, &directory, "a");
-    thread::sleep(Duration::from_millis(200));
+    wait_for_relay(&mut relay_a, a, &directory.join("a.der"));
     run(
         &client_bin,
         &client_args(
@@ -589,7 +602,7 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
     relay_c.kill().unwrap();
     relay_c.wait().unwrap();
     relay_c = server(&server_bin, c, &directory, "c");
-    thread::sleep(Duration::from_millis(200));
+    wait_for_relay(&mut relay_c, c, &directory.join("c.der"));
     run(
         &client_bin,
         &client_args(
