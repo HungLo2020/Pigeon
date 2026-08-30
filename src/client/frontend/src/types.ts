@@ -3,6 +3,7 @@ export type Message = { conversation: string; sender: string; text: string; time
 export type Conversation = { id: string; title: string; kind: "direct" | "group"; preview?: string; timestamp?: number; unread: number };
 export type Device = { id: string; state: "active" | "dormant" | "revoked"; current: boolean; last_activity?: number };
 export type Route = { server: string; revision: number; relay_fingerprint: string; tls_spki_fingerprint: string };
+export type RelayDiscovery = { address: string; relay_fingerprint: string; tls_spki_fingerprint: string; descriptor: string; requires_confirmation: boolean };
 export type LocalAccount = { id: string; label: string; identity: string };
 export type PairingStatus = { state: "waiting" | "cancelled" | "expired"; identity: string; device_id: string; expires_at: number; request_text: string };
 export type PairingRequestDetails = { identity: string; device_id: string; expires_at: number };

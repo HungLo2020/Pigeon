@@ -54,10 +54,38 @@ pub struct RoutingRecord {
     pub tls_spki_fingerprint: [u8; 32],
     pub signature: Vec<u8>,
 }
+/// Public relay discovery document.  It is intentionally not an identity or
+/// routing authority: a user only trusts it at first contact, and every later
+/// connection is pinned by the root-signed `RoutingRecord` it helps create.
+pub const RELAY_DESCRIPTOR_VERSION: u8 = 1;
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RelayDescriptor {
+    pub version: u8,
+    /// Canonical Pigeon relay socket address (`host:port` or `[v6]:port`).
+    pub address: String,
     pub identity: [u8; 32],
     pub tls_spki_fingerprint: [u8; 32],
+}
+pub fn verify_relay_descriptor(descriptor: &RelayDescriptor) -> Result<()> {
+    if descriptor.version != RELAY_DESCRIPTOR_VERSION
+        || descriptor.address.trim().is_empty()
+        || descriptor.address.contains(['\r', '\n', '/', '@'])
+        || descriptor.identity == [0; 32]
+        || descriptor.tls_spki_fingerprint == [0; 32]
+    {
+        anyhow::bail!("unsupported or malformed relay descriptor")
+    }
+    // This intentionally accepts DNS names and bracketed IPv6 addresses, but
+    // never an implicit port.  Routing and transport both require an explicit
+    // socket endpoint.
+    let Some((host, port)) = descriptor.address.rsplit_once(':') else {
+        anyhow::bail!("relay descriptor address must include a port")
+    };
+    if host.trim().is_empty() || port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        anyhow::bail!("relay descriptor address has an invalid port")
+    }
+    Ok(())
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ContactCard {
@@ -976,5 +1004,36 @@ mod tests {
         let mut bad_payload = encrypted.clone();
         bad_payload.ciphertext = vec![0];
         assert!(open_bootstrap(&request, sk.to_bytes().into(), &bad_payload).is_err());
+    }
+
+    #[test]
+    fn relay_descriptor_requires_a_versioned_complete_routing_tuple() {
+        let descriptor = RelayDescriptor {
+            version: RELAY_DESCRIPTOR_VERSION,
+            address: "relay.example:8443".into(),
+            identity: [1; 32],
+            tls_spki_fingerprint: [2; 32],
+        };
+        verify_relay_descriptor(&descriptor).unwrap();
+        for invalid in [
+            RelayDescriptor {
+                version: RELAY_DESCRIPTOR_VERSION + 1,
+                ..descriptor.clone()
+            },
+            RelayDescriptor {
+                address: "relay.example".into(),
+                ..descriptor.clone()
+            },
+            RelayDescriptor {
+                address: "https://relay.example:8443".into(),
+                ..descriptor.clone()
+            },
+            RelayDescriptor {
+                tls_spki_fingerprint: [0; 32],
+                ..descriptor.clone()
+            },
+        ] {
+            assert!(verify_relay_descriptor(&invalid).is_err());
+        }
     }
 }

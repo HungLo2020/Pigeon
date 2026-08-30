@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import grp
+import json
 import os
 import pwd
 import re
@@ -86,6 +87,29 @@ def run_as_pigeon(*command: str) -> None:
     subprocess.run(["runuser", "-u", "pigeon", "--", *command], check=True)
 
 
+def relay_descriptor(config: Path) -> dict[str, object]:
+    result = subprocess.run(
+        ["runuser", "-u", "pigeon", "--", str(SERVER), "--config", str(config), "--print-descriptor"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"relay did not emit a valid discovery descriptor: {error}") from error
+
+
+def print_connection_details(config: Path) -> None:
+    descriptor = relay_descriptor(config)
+    identity = bytes(descriptor["identity"]).hex()
+    spki = bytes(descriptor["tls_spki_fingerprint"]).hex()
+    print(f"Client connection value: {descriptor['address']}")
+    print(f"Relay identity fingerprint: {identity}")
+    print(f"TLS SPKI fingerprint: {spki}")
+    print("Discovery URL: https://<hostname>/.well-known/pigeon-relay")
+
+
 def configure_tls(data_dir: Path, uid: int, gid: int) -> tuple[Path, Path]:
     tls_dir = data_dir / "tls"
     tls_dir.mkdir(parents=True, exist_ok=True)
@@ -132,6 +156,7 @@ def main() -> int:
         if not args.no_start:
             subprocess.run(["systemctl", "enable", "--now", SERVICE], check=True)
             subprocess.run(["systemctl", "status", "--no-pager", SERVICE], check=False)
+        print_connection_details(config)
         return 0
     if config != DEFAULT_CONFIG and not args.no_start:
         raise RuntimeError("a non-default --config requires --no-start; the packaged service uses /etc/pigeon")
@@ -157,10 +182,12 @@ def main() -> int:
     print(f"Persistent configuration written to {config}")
     if args.no_start:
         print("Service was not enabled (--no-start). Start it with systemctl when ready.")
+        print_connection_details(config)
         return 0
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "--now", SERVICE], check=True)
     subprocess.run(["systemctl", "status", "--no-pager", SERVICE], check=False)
+    print_connection_details(config)
     print("Pigeon relay is enabled for boot. Logs: journalctl -u pigeon-server -f")
     return 0
 

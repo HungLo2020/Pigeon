@@ -1,5 +1,15 @@
 use super::*;
 
+/// Normal account traffic is always authenticated by the persisted signed
+/// route. The certificate-file path remains only for legacy setup and for
+/// pending pairing sessions that do not yet have account routing state.
+async fn account_request(state: &State, certificate: &str, value: Request) -> Result<Response> {
+    match state.routing.as_ref() {
+        Some(route) => pinned_request(route, value).await,
+        None => request(&state.card.server, certificate, value).await,
+    }
+}
+
 pub(super) async fn dispatch(args: Args) -> Result<()> {
     let requested_create_server = match &args.command {
         Command::Create { server, .. } => Some(server.clone()),
@@ -106,27 +116,30 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 args.state
             );
         }
-        Command::ConfigureRelay { server } => {
+        Command::DiscoverRelay { input } => {
+            let discovered = discover_relay(&input).await?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "address": discovered.descriptor.address,
+                    "relay_fingerprint": hex::encode(discovered.descriptor.identity),
+                    "tls_spki_fingerprint": hex::encode(discovered.descriptor.tls_spki_fingerprint),
+                    "descriptor": descriptor_text(&discovered.descriptor)?,
+                    "requires_confirmation": discovered.requires_confirmation,
+                }))?
+            );
+        }
+        Command::ConfigureRelay { server, descriptor } => {
             let mut state = load(&args.state)?;
             if state.routing.is_some() {
                 bail!("identity already has a configured relay")
             }
+            let descriptor =
+                configuration_descriptor(&server, descriptor.as_deref(), &args.certificate).await?;
+            let server = descriptor.address.clone();
             let signing = SigningKey::from_bytes(&state.signing_secret);
             let encryption = StaticSecret::from(state.encryption_secret);
             let card = make_card(&signing, &encryption, server.clone(), state.device.clone());
-            response_ok(
-                request(
-                    &server,
-                    &args.certificate,
-                    Request::Register {
-                        card: card.clone(),
-                        device: state.device.clone(),
-                        device_signature: vec![],
-                    },
-                )
-                .await?,
-            )?;
-            let descriptor = relay_descriptor(&server, &args.certificate).await?;
             let route = make_routing(
                 &signing,
                 server,
@@ -136,13 +149,17 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 0,
             );
             response_ok(
-                request(
-                    &route.server,
-                    &args.certificate,
-                    Request::PublishRouting(route.clone()),
+                pinned_request(
+                    &route,
+                    Request::Register {
+                        card: card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
                 )
                 .await?,
             )?;
+            response_ok(pinned_request(&route, Request::PublishRouting(route.clone())).await?)?;
             state.card = card;
             state.routing = Some(route);
             save(&args.state, &state)?;
@@ -158,8 +175,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         Command::Import { input } => {
             let state = load(&input)?;
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::Register {
                         card: state.card.clone(),
@@ -309,8 +326,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             )?;
             verify_pairing_approval(&pairing_request, &approval, now)?;
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::Register {
                         card: card.clone(),
@@ -335,8 +352,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 payload: encode(&approval)?,
             };
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::PublishPairingArtifact(approval_artifact),
                 )
@@ -353,8 +370,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 payload: encode(&(approval, encrypted))?,
             };
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::PublishPairingArtifact(bootstrap_artifact),
                 )
@@ -437,8 +454,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 read_at: HashMap::new(),
             };
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::Register {
                         card: state.card.clone(),
@@ -487,8 +504,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 display_name.trim().into(),
             );
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::Register {
                         card: state.card.clone(),
@@ -591,8 +608,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 group.merge_pending_commit(&provider)?;
                 let id = group.group_id().clone();
                 response_ok(
-                    request(
-                        &state.card.server,
+                    account_request(
+                        &state,
                         &args.certificate,
                         delivery_request(
                             &state,
@@ -630,8 +647,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .create_message(&provider, &signer, text.as_bytes())?
                 .to_bytes()?;
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     delivery_request(
                         &state,
@@ -873,8 +890,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 + 1;
             let revocation = make_revocation(&root, device_id, revision);
             response_ok(
-                request(
-                    &state.card.server,
+                account_request(
+                    &state,
                     &args.certificate,
                     Request::RevokeDevice(revocation.clone()),
                 )
@@ -918,8 +935,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                         continue;
                     }
                     response_ok(
-                        request(
-                            &state.card.server,
+                        account_request(
+                            &state,
                             &args.certificate,
                             Request::SendMls(pigeon_shared::MlsRecord {
                                 recipient_identity: identity_id(contact),
@@ -942,8 +959,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     .collect();
                 if !local_targets.is_empty() {
                     response_ok(
-                        request(
-                            &state.card.server,
+                        account_request(
+                            &state,
                             &args.certificate,
                             Request::SendMls(pigeon_shared::MlsRecord {
                                 recipient_identity: identity_id(&state.card),
@@ -976,9 +993,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         }
         Command::Migrate {
             server,
+            descriptor,
             previous_certificate,
         } => {
             let mut state = load(&args.state)?;
+            let descriptor =
+                configuration_descriptor(&server, descriptor.as_deref(), &args.certificate).await?;
+            let server = descriptor.address.clone();
             if state.card.server == server {
                 println!("already using {server}");
                 return Ok(());
@@ -997,21 +1018,6 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 state.card.revision + 1,
                 state.card.display_name.clone(),
             );
-            // Register first: a route is never published to a destination that
-            // has not accepted the identity/device records.
-            response_ok(
-                request(
-                    &server,
-                    &args.certificate,
-                    Request::Register {
-                        card: card.clone(),
-                        device: state.device.clone(),
-                        device_signature: vec![],
-                    },
-                )
-                .await?,
-            )?;
-            let descriptor = relay_descriptor(&server, &args.certificate).await?;
             let route = make_routing(
                 &root,
                 server.clone(),
@@ -1020,24 +1026,34 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 current_revision + 1,
                 current_revision,
             );
+            // Register first: a route is never published to a destination that
+            // has not accepted the identity/device records.
             response_ok(
-                request(
-                    &server,
-                    &args.certificate,
-                    Request::PublishRouting(route.clone()),
+                pinned_request(
+                    &route,
+                    Request::Register {
+                        card: card.clone(),
+                        device: state.device.clone(),
+                        device_signature: vec![],
+                    },
                 )
                 .await?,
             )?;
-            let previous_certificate = previous_certificate.as_deref().unwrap_or(&args.certificate);
-            if request(
-                &state.card.server,
-                previous_certificate,
-                Request::PublishRouting(route.clone()),
-            )
-            .await
-            .and_then(response_ok)
-            .is_err()
-            {
+            response_ok(pinned_request(&route, Request::PublishRouting(route.clone())).await?)?;
+            let previous_publish = match state.routing.as_ref() {
+                Some(previous_route) => {
+                    pinned_request(previous_route, Request::PublishRouting(route.clone())).await
+                }
+                None => {
+                    request(
+                        &state.card.server,
+                        previous_certificate.as_deref().unwrap_or(&args.certificate),
+                        Request::PublishRouting(route.clone()),
+                    )
+                    .await
+                }
+            };
+            if previous_publish.and_then(response_ok).is_err() {
                 state.pending_routing.push(route.clone());
             }
             // Contact relays are non-authoritative caches of the same signed
@@ -1082,8 +1098,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     }
                 }
             }
-            let revocations = match request(
-                &state.card.server,
+            let revocations = match account_request(
+                &state,
                 &args.certificate,
                 Request::GetRevocations {
                     identity: identity_id(&state.card),
@@ -1117,8 +1133,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 save(&args.state, &state)?;
                 bail!("this device has been revoked and cannot synchronize")
             }
-            match request(
-                &state.card.server,
+            match account_request(
+                &state,
                 &args.certificate,
                 Request::Fetch {
                     identity: identity_id(&state.card),
@@ -1295,8 +1311,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     save(&args.state, &state)?;
                     if !record_ids.is_empty() {
                         response_ok(
-                            request(
-                                &state.card.server,
+                            account_request(
+                                &state,
                                 &args.certificate,
                                 Request::Acknowledge {
                                     device_id: state.device.device_id,
@@ -1391,8 +1407,8 @@ async fn add_paired_device_to_mls_groups(
         let (commit, welcome, _) = group.add_members(&provider, &signer, &[package])?;
         group.merge_pending_commit(&provider)?;
         response_ok(
-            request(
-                &state.card.server,
+            account_request(
+                state,
                 certificate,
                 Request::SendMls(pigeon_shared::MlsRecord {
                     recipient_identity: identity_id(&state.card),

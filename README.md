@@ -101,6 +101,22 @@ state below `/var/lib/pigeon`, write `/etc/pigeon/pigeon-server.conf`, and then
 enable the relay. The package never stores mutable state below `/usr`; relay
 logs are available through `journalctl -u pigeon-server`.
 
+## Relay discovery and first contact
+
+Relay selection accepts an explicit `host:port` (including a direct IP), a
+hostname, or an HTTPS descriptor URL. A hostname is resolved at
+`https://host/.well-known/pigeon-relay`; an explicit URL such as
+`https://example.com/relay` is fetched exactly as entered. The public,
+versioned descriptor contains the canonical relay address plus its Ed25519
+relay-identity and TLS-SPKI fingerprints.
+
+Direct `host:port` onboarding supports self-signed development relays with an
+explicit trust-on-first-use confirmation: Pigeon displays both fingerprints,
+the user confirms them, and then the client pins them in its root-signed
+routing record. There is no later certificate fallback or silent identity
+change. The packaged `pigeon-setup` prints the connection value and both
+fingerprints after configuration.
+
 After successful main-branch CI, `Release latest` replaces the rolling
 `latest` release/tag with both packages and one `SHA256SUMS` file. `Debian
 package release` is manually dispatched and similarly replaces the independent

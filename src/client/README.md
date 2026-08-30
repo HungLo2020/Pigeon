@@ -14,4 +14,10 @@ Clients must expose device-management controls that distinguish active, dormant,
 
 Server changes are signed identity events. When one device changes servers, the client core must create and propagate a newer signed routing revision so the user's other devices and contacts can automatically follow the migration when they reconnect.
 
+Relay setup accepts `host:port`, a hostname, or an explicit HTTPS descriptor
+URL. Hostnames use `https://host/.well-known/pigeon-relay`; direct endpoints
+display their relay/TLS fingerprints for explicit first-contact confirmation.
+After confirmation, normal connections use only the persisted signed relay and
+TLS-SPKI pins.
+
 Local history retention should be independently configurable, initially including 30 days, 90 days, 1 year, 5 years, and forever.

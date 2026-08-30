@@ -29,6 +29,7 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
+use url::Url;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 mod history;
@@ -109,6 +110,13 @@ struct BootstrapControl {
     encryption_secret: [u8; 32],
     card: ContactCard,
 }
+#[derive(Serialize)]
+struct DiscoveredRelay {
+    descriptor: RelayDescriptor,
+    /// Direct host:port endpoints use explicit TOFU confirmation. HTTPS
+    /// discovery documents authenticated by the platform trust store do not.
+    requires_confirmation: bool,
+}
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "pigeon-identity.json")]
@@ -133,6 +141,17 @@ enum Command {
     ConfigureRelay {
         #[arg(long)]
         server: String,
+        /// Base64url JSON RelayDescriptor previously returned by
+        /// `discover-relay`. Supplying it makes setup pin-only and avoids any
+        /// certificate file dependency.
+        #[arg(long)]
+        descriptor: Option<String>,
+    },
+    DiscoverRelay {
+        /// host:port (explicit TOFU), hostname (HTTPS well-known), or an
+        /// explicit HTTPS discovery URL.
+        #[arg(long)]
+        input: String,
     },
     Export {
         #[arg(long)]
@@ -208,6 +227,10 @@ enum Command {
     Migrate {
         #[arg(long)]
         server: String,
+        /// Confirmed discovery descriptor. When present, all destination
+        /// traffic is pinned without reading an operator certificate file.
+        #[arg(long)]
+        descriptor: Option<String>,
         /// Certificate for the previous relay, used only to publish the
         /// already-signed MOVED route before switching local state.
         #[arg(long)]
@@ -337,13 +360,54 @@ impl ServerCertVerifier for SpkiVerifier {
         ]
     }
 }
+/// Used only to read a public descriptor from an explicit `host:port` first
+/// contact. Its result is displayed and requires user confirmation; it is
+/// never persisted or used for normal protocol traffic until the subsequent
+/// pinned connection proves the displayed SPKI again.
+#[derive(Debug)]
+struct DiscoveryVerifier;
+impl ServerCertVerifier for DiscoveryVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        SpkiVerifier([0; 32]).supported_verify_schemes()
+    }
+}
 async fn pinned_request(route: &RoutingRecord, value: Request) -> Result<Response> {
     pigeon_shared::verify_routing(route)?;
+    spki_request(&route.server, route.tls_spki_fingerprint, value).await
+}
+
+async fn spki_request(server: &str, pin: [u8; 32], value: Request) -> Result<Response> {
     let config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SpkiVerifier(route.tls_spki_fingerprint)))
+        .with_custom_certificate_verifier(Arc::new(SpkiVerifier(pin)))
         .with_no_client_auth();
-    let stream = TcpStream::connect(&route.server).await?;
+    let stream = TcpStream::connect(server).await?;
     let mut tls = TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from("localhost")?.to_owned(), stream)
         .await?;
@@ -371,6 +435,7 @@ async fn relay_descriptor(server: &str, certificate: &str) -> Result<RelayDescri
     else {
         bail!("relay did not provide an identity and TLS SPKI pin")
     };
+    pigeon_shared::verify_relay_descriptor(&descriptor)?;
     Ok(descriptor)
 }
 async fn pinned_relay_descriptor(route: &RoutingRecord) -> Result<RelayDescriptor> {
@@ -379,16 +444,182 @@ async fn pinned_relay_descriptor(route: &RoutingRecord) -> Result<RelayDescripto
     else {
         bail!("relay did not provide an identity and TLS SPKI pin")
     };
+    pigeon_shared::verify_relay_descriptor(&descriptor)?;
     Ok(descriptor)
 }
 fn validate_route_descriptor(route: &RoutingRecord, descriptor: &RelayDescriptor) -> Result<()> {
     pigeon_shared::verify_routing(route)?;
+    pigeon_shared::verify_relay_descriptor(descriptor)?;
     if route.relay_identity != descriptor.identity
         || route.tls_spki_fingerprint != descriptor.tls_spki_fingerprint
+        || route.server != descriptor.address
     {
-        bail!("routing record relay identity/TLS SPKI fingerprint mismatch")
+        bail!("routing record relay address/identity/TLS SPKI fingerprint mismatch")
     }
     Ok(())
+}
+
+fn descriptor_text(descriptor: &RelayDescriptor) -> Result<String> {
+    pigeon_shared::verify_relay_descriptor(descriptor)?;
+    Ok(STANDARD_NO_PAD.encode(serde_json::to_vec(descriptor)?))
+}
+
+fn parse_descriptor_text(value: &str) -> Result<RelayDescriptor> {
+    let descriptor: RelayDescriptor =
+        serde_json::from_slice(&STANDARD_NO_PAD.decode(value.trim())?)?;
+    pigeon_shared::verify_relay_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+fn direct_endpoint(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(['/', '@', '?', '#']) {
+        return Ok(None);
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Ok(None);
+    };
+    if host.trim().is_empty() || port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        bail!("relay endpoint must be host:port with a port from 1 to 65535")
+    }
+    Ok(Some(value.to_owned()))
+}
+
+async fn direct_relay_descriptor(server: &str) -> Result<RelayDescriptor> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DiscoveryVerifier))
+        .with_no_client_auth();
+    let stream = TcpStream::connect(server).await?;
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost")?.to_owned(), stream)
+        .await?;
+    write_frame(&mut tls, &encode(&Request::GetRelayDescriptor)?).await?;
+    let Response::RelayDescriptor(descriptor) = decode(&read_frame(&mut tls).await?)? else {
+        bail!("relay did not provide a discovery descriptor")
+    };
+    pigeon_shared::verify_relay_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+async fn https_relay_descriptor(input: &str) -> Result<RelayDescriptor> {
+    let url = if input.starts_with("https://") {
+        Url::parse(input)?
+    } else {
+        Url::parse(&format!("https://{input}/.well-known/pigeon-relay"))?
+    };
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.username() != ""
+        || url.password().is_some()
+    {
+        bail!("relay discovery URL must be an absolute HTTPS URL without credentials")
+    }
+    let host = url.host_str().expect("checked host");
+    let port = url
+        .port_or_known_default()
+        .context("HTTPS URL has no port")?;
+    let socket = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let stream = TcpStream::connect(socket).await?;
+    let name = ServerName::try_from(host.to_owned())?.to_owned();
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .await?;
+    let mut path = url.path().to_owned();
+    if path.is_empty() {
+        path = "/".into();
+    }
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await?;
+    parse_https_discovery_response(&response)
+}
+
+fn parse_https_discovery_response(response: &[u8]) -> Result<RelayDescriptor> {
+    let Some(separator) = response.windows(4).position(|value| value == b"\r\n\r\n") else {
+        bail!("malformed HTTPS relay discovery response")
+    };
+    let header = std::str::from_utf8(&response[..separator])?;
+    if !header.starts_with("HTTP/1.1 200 ") && !header.starts_with("HTTP/1.0 200 ") {
+        bail!(
+            "HTTPS relay discovery returned {}",
+            header.lines().next().unwrap_or("an invalid status")
+        )
+    }
+    let descriptor: RelayDescriptor = serde_json::from_slice(&response[separator + 4..])?;
+    pigeon_shared::verify_relay_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+async fn discover_relay(input: &str) -> Result<DiscoveredRelay> {
+    if let Some(endpoint) = direct_endpoint(input)? {
+        let descriptor = direct_relay_descriptor(&endpoint).await?;
+        validate_direct_descriptor(&endpoint, &descriptor)?;
+        return Ok(DiscoveredRelay {
+            descriptor,
+            requires_confirmation: true,
+        });
+    }
+    Ok(DiscoveredRelay {
+        descriptor: https_relay_descriptor(input.trim()).await?,
+        requires_confirmation: false,
+    })
+}
+
+fn validate_direct_descriptor(endpoint: &str, descriptor: &RelayDescriptor) -> Result<()> {
+    pigeon_shared::verify_relay_descriptor(descriptor)?;
+    if descriptor.address != endpoint {
+        bail!("direct relay descriptor address does not match the entered endpoint")
+    }
+    Ok(())
+}
+
+async fn verify_descriptor_endpoint(descriptor: &RelayDescriptor) -> Result<()> {
+    pigeon_shared::verify_relay_descriptor(descriptor)?;
+    let Response::RelayDescriptor(observed) = spki_request(
+        &descriptor.address,
+        descriptor.tls_spki_fingerprint,
+        Request::GetRelayDescriptor,
+    )
+    .await?
+    else {
+        bail!("relay did not provide a descriptor after pinned connection")
+    };
+    pigeon_shared::verify_relay_descriptor(&observed)?;
+    if &observed != descriptor {
+        bail!("pinned relay descriptor differs from the confirmed discovery descriptor")
+    }
+    Ok(())
+}
+
+async fn configuration_descriptor(
+    server: &str,
+    encoded: Option<&str>,
+    certificate: &str,
+) -> Result<RelayDescriptor> {
+    match encoded {
+        Some(encoded) => {
+            let descriptor = parse_descriptor_text(encoded)?;
+            verify_descriptor_endpoint(&descriptor).await?;
+            Ok(descriptor)
+        }
+        None => relay_descriptor(server, certificate).await,
+    }
 }
 fn delivery_request(
     state: &State,
@@ -450,27 +681,24 @@ async fn deliver_group_payload(
             continue;
         }
         let contact = contact_for(state, *identity)?;
-        response_ok(
-            request(
-                &state.card.server,
-                certificate,
-                delivery_request(
-                    state,
-                    &contact,
-                    pigeon_shared::MlsRecord {
-                        recipient_identity: *identity,
-                        sender_device: state.device.device_id,
-                        target_devices: contact
-                            .devices
-                            .iter()
-                            .map(|device| device.device_id)
-                            .collect(),
-                        payload: payload.clone(),
-                    },
-                )?,
-            )
-            .await?,
+        let request_value = delivery_request(
+            state,
+            &contact,
+            pigeon_shared::MlsRecord {
+                recipient_identity: *identity,
+                sender_device: state.device.device_id,
+                target_devices: contact
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id)
+                    .collect(),
+                payload: payload.clone(),
+            },
         )?;
+        response_ok(match state.routing.as_ref() {
+            Some(route) => pinned_request(route, request_value).await?,
+            None => request(&state.card.server, certificate, request_value).await?,
+        })?;
     }
     Ok(())
 }
@@ -479,4 +707,94 @@ mod commands;
 #[tokio::main]
 async fn main() -> Result<()> {
     commands::dispatch(Args::parse()).await
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    fn descriptor(address: &str) -> RelayDescriptor {
+        RelayDescriptor {
+            version: pigeon_shared::RELAY_DESCRIPTOR_VERSION,
+            address: address.into(),
+            identity: [1; 32],
+            tls_spki_fingerprint: [2; 32],
+        }
+    }
+
+    #[test]
+    fn direct_endpoint_requires_an_explicit_socket_port() {
+        assert_eq!(
+            direct_endpoint("100.72.33.98:8443").unwrap(),
+            Some("100.72.33.98:8443".into())
+        );
+        assert_eq!(direct_endpoint("relay.example").unwrap(), None);
+        assert_eq!(direct_endpoint("https://relay.example/path").unwrap(), None);
+        assert!(direct_endpoint("relay.example:0").is_err());
+    }
+
+    #[test]
+    fn direct_first_contact_rejects_descriptor_address_substitution() {
+        validate_direct_descriptor("100.72.33.98:8443", &descriptor("100.72.33.98:8443")).unwrap();
+        assert!(
+            validate_direct_descriptor("100.72.33.98:8443", &descriptor("evil.example:8443"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn descriptor_text_is_version_checked_before_pinning() {
+        let text = descriptor_text(&descriptor("relay.example:8443")).unwrap();
+        assert_eq!(
+            parse_descriptor_text(&text).unwrap().address,
+            "relay.example:8443"
+        );
+        let invalid = RelayDescriptor {
+            version: 99,
+            ..descriptor("relay.example:8443")
+        };
+        let text = STANDARD_NO_PAD.encode(serde_json::to_vec(&invalid).unwrap());
+        assert!(parse_descriptor_text(&text).is_err());
+    }
+
+    #[test]
+    fn https_descriptor_response_parsing_rejects_bad_status_and_payloads() {
+        let body = serde_json::to_vec(&descriptor("relay.example:8443")).unwrap();
+        let response = [
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".as_slice(),
+            body.as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            parse_https_discovery_response(&response).unwrap().address,
+            "relay.example:8443"
+        );
+        assert!(parse_https_discovery_response(b"HTTP/1.1 404 Nope\r\n\r\n{}").is_err());
+        assert!(parse_https_discovery_response(b"not HTTP").is_err());
+        assert!(parse_https_discovery_response(b"HTTP/1.1 200 OK\r\n\r\nnot-json").is_err());
+    }
+
+    #[test]
+    fn route_descriptor_validation_rejects_fingerprint_substitution() {
+        let root = SigningKey::generate(&mut OsRng);
+        let route =
+            pigeon_shared::make_routing(&root, "relay.example:8443".into(), [1; 32], [2; 32], 1, 0);
+        validate_route_descriptor(&route, &descriptor("relay.example:8443")).unwrap();
+        assert!(validate_route_descriptor(
+            &route,
+            &RelayDescriptor {
+                identity: [3; 32],
+                ..descriptor("relay.example:8443")
+            },
+        )
+        .is_err());
+        assert!(validate_route_descriptor(
+            &route,
+            &RelayDescriptor {
+                tls_spki_fingerprint: [4; 32],
+                ..descriptor("relay.example:8443")
+            },
+        )
+        .is_err());
+    }
 }

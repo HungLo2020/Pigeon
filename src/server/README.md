@@ -60,3 +60,12 @@ available. Relay logs use the normal systemd journal:
 ```bash
 journalctl -u pigeon-server -f
 ```
+
+## Public discovery document
+
+The TLS listener also serves a public JSON `RelayDescriptor` for HTTPS GET
+requests (normally `/.well-known/pigeon-relay`). It exposes only the configured
+canonical relay address, the persistent relay Ed25519 public-key fingerprint,
+the TLS-SPKI fingerprint, and a descriptor version. It does not authorize a
+user identity or replace signed routing records. A reverse proxy/domain can
+serve the same document at another explicit HTTPS path.

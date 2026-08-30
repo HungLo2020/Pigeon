@@ -96,6 +96,24 @@ fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
 }
 
 #[test]
+fn relay_descriptor_is_versioned_and_bound_to_persistent_relay_state() {
+    let db = Connection::open_in_memory().unwrap();
+    initialize(&db).unwrap();
+    set_relay_address(&db, "relay.example:8443").unwrap();
+    bind_relay_tls_spki(&db, [9; 32]).unwrap();
+    let Response::RelayDescriptor(first) = process(&db, Request::GetRelayDescriptor) else {
+        panic!("expected relay descriptor")
+    };
+    pigeon_shared::verify_relay_descriptor(&first).unwrap();
+    assert_eq!(first.address, "relay.example:8443");
+    assert_eq!(first.version, pigeon_shared::RELAY_DESCRIPTOR_VERSION);
+    let Response::RelayDescriptor(after_restart) = process(&db, Request::GetRelayDescriptor) else {
+        panic!("expected relay descriptor after restart")
+    };
+    assert_eq!(first, after_restart);
+}
+
+#[test]
 fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
     let path = std::env::temp_dir().join(format!(
         "pigeon-pairing-{}-{}.sqlite",

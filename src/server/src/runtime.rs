@@ -1,4 +1,5 @@
 use super::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "lifecycle.rs"]
 mod lifecycle;
@@ -15,6 +16,15 @@ pub(crate) use schema::initialize;
 
 type PairingRequestRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 type PairingBootstrapRow = (i64, i64, i64, Vec<u8>, Vec<u8>);
+
+pub(crate) fn descriptor(connection: &Connection) -> Result<RelayDescriptor> {
+    Ok(RelayDescriptor {
+        version: pigeon_shared::RELAY_DESCRIPTOR_VERSION,
+        address: relay_address(connection)?,
+        identity: relay_identity(connection)?,
+        tls_spki_fingerprint: relay_tls_spki(connection)?,
+    })
+}
 
 fn decode_indexed_pairing_artifact(
     bytes: &[u8],
@@ -297,10 +307,7 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                     route.map(|bytes| decode(&bytes)).transpose()?,
                 ))
             }
-            Request::GetRelayDescriptor => Ok(Response::RelayDescriptor(RelayDescriptor {
-                identity: relay_identity(connection)?,
-                tls_spki_fingerprint: relay_tls_spki(connection)?,
-            })),
+            Request::GetRelayDescriptor => Ok(Response::RelayDescriptor(descriptor(connection)?)),
             Request::PublishPairingArtifact(artifact) => {
                 pigeon_shared::verify_pairing_artifact(&artifact, now)?;
                 let kind = encode(&artifact.kind)?;
@@ -603,7 +610,11 @@ pub(super) async fn handle(
     database: Arc<Mutex<Connection>>,
 ) -> Result<()> {
     let mut tls = acceptor.accept(stream).await?;
-    let request = decode(&read_frame(&mut tls).await?)?;
+    let first = tls.read_u8().await?;
+    if first == b'G' {
+        return handle_discovery_http(&mut tls, database).await;
+    }
+    let request = decode(&read_prefixed_frame(&mut tls, first).await?)?;
     let response = {
         let connection = database
             .lock()
@@ -611,6 +622,66 @@ pub(super) async fn handle(
         process(&connection, request)
     };
     write_frame(&mut tls, &encode(&response)?).await
+}
+
+/// The relay protocol remains length-delimited TLS.  Discovery deliberately
+/// shares that TLS listener so a simple self-hosted relay does not need a
+/// second public port; the first plaintext byte after TLS selects either a
+/// public HTTP GET or the existing binary protocol frame.
+async fn read_prefixed_frame<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    first: u8,
+) -> Result<Vec<u8>> {
+    let mut length = [first, 0, 0, 0];
+    stream.read_exact(&mut length[1..]).await?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > 16 * 1024 * 1024 {
+        bail!("frame too large")
+    }
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn handle_discovery_http<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    database: Arc<Mutex<Connection>>,
+) -> Result<()> {
+    let mut request = vec![b'G'];
+    while !request.ends_with(b"\r\n\r\n") {
+        if request.len() >= 16 * 1024 {
+            bail!("discovery HTTP request too large")
+        }
+        request.push(stream.read_u8().await?);
+    }
+    let request = std::str::from_utf8(&request).context("invalid discovery HTTP request")?;
+    let mut words = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_ascii_whitespace();
+    let method = words.next();
+    let path = words.next();
+    let valid_get = method == Some("GET") && path.is_some_and(|path| path.starts_with('/'));
+    let (status, body) = if valid_get {
+        let descriptor = {
+            let connection = database
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            descriptor(&connection)?
+        };
+        ("200 OK", serde_json::to_vec(&descriptor)?)
+    } else {
+        ("404 Not Found", b"not found\n".to_vec())
+    };
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]

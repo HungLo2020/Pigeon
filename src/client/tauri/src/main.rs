@@ -49,6 +49,14 @@ struct Route {
     relay_fingerprint: String,
     tls_spki_fingerprint: String,
 }
+#[derive(Serialize, Deserialize, Clone)]
+struct RelayDiscovery {
+    address: String,
+    relay_fingerprint: String,
+    tls_spki_fingerprint: String,
+    descriptor: String,
+    requires_confirmation: bool,
+}
 #[derive(Serialize, Clone)]
 struct Message {
     conversation: String,
@@ -491,12 +499,42 @@ fn select_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
     save_index(&app, &account_index)
 }
 #[tauri::command]
-fn configure_relay(app: tauri::AppHandle, server: String) -> Result<(), String> {
-    core(&app, &["configure-relay".into(), "--server".into(), server]).map(|_| ())
+fn discover_relay(app: tauri::AppHandle, input: String) -> Result<RelayDiscovery, String> {
+    let output = core(&app, &["discover-relay".into(), "--input".into(), input])?;
+    serde_json::from_str(output.trim())
+        .map_err(|error| format!("invalid relay discovery result: {error}"))
 }
 #[tauri::command]
-fn migrate_relay(app: tauri::AppHandle, server: String) -> Result<(), String> {
-    core(&app, &["migrate".into(), "--server".into(), server]).map(|_| ())
+fn configure_relay(
+    app: tauri::AppHandle,
+    server: String,
+    descriptor: String,
+) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "configure-relay".into(),
+            "--server".into(),
+            server,
+            "--descriptor".into(),
+            descriptor,
+        ],
+    )
+    .map(|_| ())
+}
+#[tauri::command]
+fn migrate_relay(app: tauri::AppHandle, server: String, descriptor: String) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "migrate".into(),
+            "--server".into(),
+            server,
+            "--descriptor".into(),
+            descriptor,
+        ],
+    )
+    .map(|_| ())
 }
 #[tauri::command]
 fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
@@ -712,6 +750,7 @@ fn main() {
             set_nickname,
             set_appearance,
             select_account,
+            discover_relay,
             configure_relay,
             migrate_relay,
             import_account,

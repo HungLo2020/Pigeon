@@ -49,6 +49,9 @@ struct Args {
     /// Initialize persistent TLS/relay/database state and exit without binding a socket.
     #[arg(long)]
     initialize_only: bool,
+    /// Print the public JSON discovery descriptor after initializing persistent state.
+    #[arg(long)]
+    print_descriptor: bool,
 }
 
 impl Args {
@@ -87,8 +90,8 @@ const RETENTION_SECONDS: i64 = 14 * 24 * 60 * 60;
 
 mod runtime;
 use runtime::{
-    bind_relay_tls_spki, flush_network_outbound, handle, initialize, maintain_lifecycle,
-    set_relay_address, system_now,
+    bind_relay_tls_spki, descriptor, flush_network_outbound, handle, initialize,
+    maintain_lifecycle, set_relay_address, system_now,
 };
 
 #[tokio::main]
@@ -107,6 +110,10 @@ async fn main() -> Result<()> {
     initialize(&database)?;
     bind_relay_tls_spki(&database, tls_spki_fingerprint(&cert)?)?;
     set_relay_address(&database, &settings.public_address)?;
+    if args.print_descriptor {
+        println!("{}", serde_json::to_string(&descriptor(&database)?)?);
+        return Ok(());
+    }
     if args.initialize_only {
         eprintln!(
             "pigeon relay state initialized for {}",
@@ -167,6 +174,7 @@ mod cli_tests {
             certificate: None,
             private_key: None,
             initialize_only: false,
+            print_descriptor: false,
         };
         let settings = args.settings().unwrap();
         assert_eq!(settings.listen, "127.0.0.1:9443");

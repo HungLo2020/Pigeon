@@ -24,3 +24,5 @@ openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = "0.5"
 pigeon-shared = { path = "../../shared" }
+url.workspace = true
+webpki-roots.workspace = true
