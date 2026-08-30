@@ -33,9 +33,10 @@ for pairwise and group messaging.
 
 ## Enrollment and recovery
 
-New devices are authorized by an existing authorized device, normally through
-a QR transfer or explicit approval. A user-controlled identity backup may be
-imported when no existing device is available; it is not a
+New devices are authorized by an existing authorized device plus
+password-unlocked independent recovery authority, normally through QR transfer
+or explicit approval. A user-controlled encrypted backup may be imported when
+no existing device is available; it creates a fresh endpoint and is not a
 server-held password or account-reset mechanism.
 
 ## Consequences

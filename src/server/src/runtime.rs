@@ -54,21 +54,55 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
         match request {
             Request::Register { card, device, .. } => {
                 verify_card(&card)?;
-                verify_device(&device)?;
-                if device.identity != identity_id(&card)
-                    || !card
-                        .devices
-                        .iter()
-                        .any(|candidate| candidate.device_id == device.device_id)
-                {
+                let registered_device = card.devices.iter().find(|candidate| {
+                    candidate.device_id == device.device_id
+                        && candidate.device_key == device.device_key
+                });
+                if registered_device.is_none() {
                     bail!("registering device is not authorized by the contact card")
+                }
+                let device = registered_device.expect("checked card membership").clone();
+                verify_device_with_genesis(&device, &card.genesis)?;
+                let existing: Option<Vec<u8>> = connection
+                    .query_row(
+                        "SELECT card FROM identities WHERE id = ?1",
+                        params![identity_id(&card).to_vec()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    let existing: pigeon_shared::ContactCard = decode(&existing)?;
+                    verify_card(&existing)?;
+                    if existing.genesis != card.genesis {
+                        bail!("conflicting immutable account genesis for registered identity")
+                    }
+                    if card.revision < existing.revision {
+                        bail!("stale signed account profile registration")
+                    }
+                    if card.revision == existing.revision && encode(&card)? != encode(&existing)? {
+                        bail!("conflicting signed account profile at the same revision")
+                    }
+                    if card.authorized_devices.revision > existing.authorized_devices.revision {
+                        verify_roster_transition(
+                            &existing.authorized_devices,
+                            &card.authorized_devices,
+                        )?;
+                    } else if card.authorized_devices.revision
+                        < existing.authorized_devices.revision
+                    {
+                        bail!("stale account roster registration")
+                    } else if roster_hash(&card.authorized_devices)
+                        != roster_hash(&existing.authorized_devices)
+                    {
+                        bail!("conflicting account roster at the same revision")
+                    }
                 }
                 connection.execute(
                     "INSERT OR REPLACE INTO identities (id, card) VALUES (?1, ?2)",
                     params![identity_id(&card).to_vec(), encode(&card)?],
                 )?;
                 for authorized in &card.devices {
-                    verify_device(authorized)?;
+                    verify_device_with_genesis(authorized, &card.genesis)?;
                     // A later registration may refresh an authorized device record, but
                     // can never resurrect a revoked credential.  Re-adding a physical
                     // device needs a new, explicitly root-authorized device credential.
@@ -268,6 +302,19 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
             }
             Request::PublishRouting(route) => {
                 verify_routing(&route)?;
+                let registered: Option<Vec<u8>> = connection
+                    .query_row(
+                        "SELECT card FROM identities WHERE id = ?1",
+                        params![route.identity.to_vec()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(card) = registered {
+                    let card: pigeon_shared::ContactCard = decode(&card)?;
+                    if card.genesis != route.genesis {
+                        bail!("routing record genesis does not match registered account")
+                    }
+                }
                 // A relay may cache a self-authenticating route learned via a
                 // contact path. The client still registers at a migration
                 // destination before publication; this cache never grants the

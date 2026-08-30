@@ -10,8 +10,9 @@
 
 - No email address or phone number required.
 - User identity is cryptographic and independent of any server or external platform.
-- Users can export and import a portable backup of their root identity
-  material to restore authority on a new device after device loss.
+- Users can export and import a password-encrypted portable recovery backup to
+  restore authority on a fresh device after device loss without cloning an old
+  device or MLS runtime.
 - Multi-device support without allowing a server to own or recreate a user's identity.
 - Direct and group text messaging.
 - Ordinary group chats are ownerless: any participant may add or remove any
@@ -30,10 +31,12 @@
 
 ## Identity and Routing
 
-- A user's stable identity is a long-lived cryptographic identity key.
-- Every authorized device is an equal peer: it holds the same root identity
-  private key and a distinct device private key/credential. No server or
-  device is a privileged master authority.
+- A user's stable identity is the hash of an immutable, versioned account
+  genesis record, not a root public key alone.
+- Every authorized device is an equal peer with a distinct device credential.
+  Root signatures remain necessary but root-key possession alone cannot enroll
+  an endpoint into an established account: normal enrollment also requires an
+  existing-device approval and password-unlocked independent recovery authority.
 - The server currently used by that identity is routing metadata, not part of the identity itself.
 - Public contact information carries the identity plus a current server hint.
 - A signed contact card is the canonical public-contact payload. QR codes,

@@ -1,12 +1,163 @@
 use super::*;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use pigeon_shared::{
-    make_card, make_card_with_devices, make_device, make_relay_forward, make_revocation,
-    make_routing, MlsRecord, PairingArtifactKind, PairingRelayArtifact,
+    account_id, make_authorized_device_set, make_card_from_roster, make_relay_forward,
+    AccountTransitionKind, DeviceRecord, MlsRecord, PairingArtifactKind, PairingRelayArtifact,
+    PigeonAccountGenesis,
 };
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
+use sha2::{Digest, Sha256};
 use x25519_dalek::StaticSecret;
+
+// Existing relay tests exercise delivery rather than account creation. These
+// fixtures construct a valid recovery-authorized public account state without
+// reintroducing a production root-only constructor.
+fn fixture_recovery(root: &SigningKey) -> SigningKey {
+    SigningKey::from_bytes(
+        &Sha256::digest(
+            [
+                b"pigeon-test-recovery".as_slice(),
+                root.to_bytes().as_slice(),
+            ]
+            .concat(),
+        )
+        .into(),
+    )
+}
+fn fixture_genesis(root: &SigningKey) -> PigeonAccountGenesis {
+    let recovery = fixture_recovery(root);
+    PigeonAccountGenesis {
+        version: pigeon_shared::ACCOUNT_GENESIS_VERSION,
+        root_public_key: root.verifying_key().to_bytes(),
+        initial_device_key: root.verifying_key().to_bytes(),
+        recovery_public_key: recovery.verifying_key().to_bytes(),
+        nonce: Sha256::digest(
+            [
+                b"pigeon-test-genesis".as_slice(),
+                root.to_bytes().as_slice(),
+            ]
+            .concat(),
+        )
+        .into(),
+        initial_display_name: "Fixture".into(),
+    }
+}
+fn make_device(root: &SigningKey, device: &SigningKey, package: Vec<u8>) -> DeviceRecord {
+    let key = device.verifying_key().to_bytes();
+    let mut record = DeviceRecord {
+        identity: root.verifying_key().to_bytes(),
+        device_id: key,
+        device_key: key,
+        mls_key_package: package,
+        authorization_revision: 1,
+        signature: vec![0; 64],
+    };
+    record.signature = root
+        .sign(
+            &bincode::serialize(&(
+                record.identity,
+                record.device_id,
+                record.device_key,
+                &record.mls_key_package,
+                record.authorization_revision,
+            ))
+            .unwrap(),
+        )
+        .to_bytes()
+        .to_vec();
+    record
+}
+fn fixture_card(
+    root: &SigningKey,
+    encryption: &StaticSecret,
+    server: String,
+    devices: Vec<DeviceRecord>,
+    revision: u64,
+) -> pigeon_shared::ContactCard {
+    let genesis = fixture_genesis(root);
+    let identity = account_id(&genesis).unwrap();
+    let recovery = fixture_recovery(root);
+    let devices: Vec<_> = devices
+        .into_iter()
+        .map(|mut device| {
+            device.identity = identity;
+            device.signature = root
+                .sign(
+                    &bincode::serialize(&(
+                        device.identity,
+                        device.device_id,
+                        device.device_key,
+                        &device.mls_key_package,
+                        device.authorization_revision,
+                    ))
+                    .unwrap(),
+                )
+                .to_bytes()
+                .to_vec();
+            device
+        })
+        .collect();
+    let roster = make_authorized_device_set(
+        genesis.clone(),
+        root,
+        &recovery,
+        devices,
+        1,
+        None,
+        None,
+        AccountTransitionKind::Recovery,
+    )
+    .unwrap();
+    make_card_from_roster(
+        root,
+        genesis,
+        encryption,
+        server,
+        roster,
+        revision,
+        "Fixture".into(),
+    )
+    .unwrap()
+}
+fn make_card(
+    root: &SigningKey,
+    encryption: &StaticSecret,
+    server: String,
+    device: DeviceRecord,
+) -> pigeon_shared::ContactCard {
+    fixture_card(root, encryption, server, vec![device], 1)
+}
+fn make_card_with_devices(
+    root: &SigningKey,
+    encryption: &StaticSecret,
+    server: String,
+    devices: Vec<DeviceRecord>,
+    revision: u64,
+) -> pigeon_shared::ContactCard {
+    fixture_card(root, encryption, server, devices, revision)
+}
+fn make_routing(
+    root: &SigningKey,
+    server: String,
+    relay: [u8; 32],
+    tls: [u8; 32],
+    revision: u64,
+    parent: u64,
+) -> RoutingRecord {
+    pigeon_shared::make_routing(
+        root,
+        fixture_genesis(root),
+        server,
+        relay,
+        tls,
+        revision,
+        parent,
+    )
+}
+fn make_revocation(root: &SigningKey, device: [u8; 32], revision: u64) -> DeviceRevocation {
+    pigeon_shared::make_revocation(root, fixture_genesis(root), device, revision)
+}
 
 fn pairing_artifact(
     kind: PairingArtifactKind,
@@ -478,7 +629,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         Response::Ok
     ));
     let record = MlsRecord {
-        recipient_identity: root.verifying_key().to_bytes(),
+        recipient_identity: identity_id(&card),
         sender_device: [7; 32],
         target_devices: vec![a1_record.device_id, a2_record.device_id],
         payload: vec![9],
@@ -490,7 +641,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
     let Response::MlsMessages(a1_events) = process(
         &database,
         Request::Fetch {
-            identity: root.verifying_key().to_bytes(),
+            identity: identity_id(&card),
             device_id: a1_record.device_id,
             known_routing_revision: 0,
         },
@@ -519,7 +670,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::SendMls(MlsRecord {
-                recipient_identity: root.verifying_key().to_bytes(),
+                recipient_identity: identity_id(&card),
                 sender_device: [8; 32],
                 target_devices: vec![a2_record.device_id],
                 payload: vec![10],
@@ -538,7 +689,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Fetch {
-                identity: root.verifying_key().to_bytes(),
+                identity: identity_id(&card),
                 device_id: a2_record.device_id,
                 known_routing_revision: 0,
             }
@@ -550,7 +701,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
     let Response::Revocations(revocations) = process(
         &database,
         Request::GetRevocations {
-            identity: root.verifying_key().to_bytes(),
+            identity: identity_id(&card),
         },
     ) else {
         panic!("expected revocation sync")
@@ -562,7 +713,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Register {
-                card,
+                card: card.clone(),
                 device: a2_record,
                 device_signature: vec![]
             }
@@ -573,7 +724,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Fetch {
-                identity: root.verifying_key().to_bytes(),
+                identity: identity_id(&card),
                 device_id: a2.verifying_key().to_bytes(),
                 known_routing_revision: 0,
             }
@@ -637,7 +788,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     let just_before_dormancy = start + DORMANCY_SECONDS - 1;
     let send = |payload| {
         Request::SendMls(MlsRecord {
-            recipient_identity: alice_root.verifying_key().to_bytes(),
+            recipient_identity: identity_id(&alice_card),
             sender_device: b1_record.device_id,
             target_devices: vec![a1_record.device_id, a2_record.device_id],
             payload,
@@ -676,7 +827,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::GetRevocations {
-                identity: alice_root.verifying_key().to_bytes()
+                identity: identity_id(&alice_card)
             },
             dormant_at,
         ),
@@ -781,7 +932,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::Register {
-                card: alice_card,
+                card: alice_card.clone(),
                 device: a2_record,
                 device_signature: vec![]
             },
@@ -795,7 +946,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::GetRevocations {
-                identity: alice_root.verifying_key().to_bytes()
+                identity: identity_id(&alice_card)
             },
             dormant_at + 1 + RETENTION_SECONDS
         ),
@@ -922,16 +1073,16 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     // Simulate an offline old relay: the destination retains the valid
     // route and can serve it when another reachable path learns it.
     assert!(
-        matches!(process(&new, Request::GetRouting { identity: root.verifying_key().to_bytes() }), Response::Routing(Some(route)) if route == moved)
+        matches!(process(&new, Request::GetRouting { identity: identity_id(&old_card) }), Response::Routing(Some(route)) if route == moved)
     );
     assert!(matches!(
         process(&old, Request::PublishRouting(moved.clone())),
         Response::Ok
     ));
     assert!(
-        matches!(process(&old, Request::Fetch { identity: root.verifying_key().to_bytes(), device_id: a2_record.device_id, known_routing_revision: 1 }), Response::Moved(route) if route == moved)
+        matches!(process(&old, Request::Fetch { identity: identity_id(&old_card), device_id: a2_record.device_id, known_routing_revision: 1 }), Response::Moved(route) if route == moved)
     );
-    assert_eq!(moved.identity, root.verifying_key().to_bytes());
+    assert_eq!(moved.identity, identity_id(&old_card));
     let mut forged = moved.clone();
     forged.server = "attacker.test".into();
     assert!(matches!(
@@ -953,7 +1104,7 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     let Response::Routing(Some(chosen)) = process(
         &old,
         Request::GetRouting {
-            identity: root.verifying_key().to_bytes(),
+            identity: identity_id(&old_card),
         },
     ) else {
         panic!("missing route")
@@ -969,7 +1120,7 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     drop(new);
     let new = Connection::open(&path).unwrap();
     assert!(
-        matches!(process(&new, Request::GetRouting { identity: root.verifying_key().to_bytes() }), Response::Routing(Some(route)) if route.revision == 2)
+        matches!(process(&new, Request::GetRouting { identity: identity_id(&old_card) }), Response::Routing(Some(route)) if route.revision == 2)
     );
     let _ = std::fs::remove_file(path);
 }
@@ -1051,7 +1202,7 @@ fn authenticated_opaque_forwarding_queues_retries_and_delivers() {
         process(
             &destination,
             Request::Register {
-                card,
+                card: card.clone(),
                 device: bob_device.clone(),
                 device_signature: vec![]
             }
@@ -1071,7 +1222,7 @@ fn authenticated_opaque_forwarding_queues_retries_and_delivers() {
         Response::Ok
     ));
     let record = MlsRecord {
-        recipient_identity: bob_root.verifying_key().to_bytes(),
+        recipient_identity: identity_id(&card),
         sender_device: [7; 32],
         target_devices: vec![bob_device.device_id],
         payload: vec![8, 9],
@@ -1097,7 +1248,7 @@ fn authenticated_opaque_forwarding_queues_retries_and_delivers() {
     let Response::MlsMessages(events) = process(
         &destination,
         Request::Fetch {
-            identity: bob_root.verifying_key().to_bytes(),
+            identity: identity_id(&card),
             device_id: bob_device.device_id,
             known_routing_revision: 1,
         },

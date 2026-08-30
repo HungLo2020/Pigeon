@@ -3,9 +3,17 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+fn relay_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("relay test lock")
+}
 
 fn run(binary: &Path, arguments: &[String]) -> String {
     let output = Command::new(binary)
@@ -83,7 +91,92 @@ fn client_args(state: &Path, certificate: &Path, command: Vec<String>) -> Vec<St
 }
 
 #[test]
+fn encrypted_backup_recovers_a_fresh_device_without_history_or_mls_epoch_state() {
+    let client = PathBuf::from(env!("CARGO_BIN_EXE_pigeon-client"));
+    let directory = std::env::temp_dir().join(format!(
+        "pigeon-backup-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let original = directory.join("original.json");
+    let recovered = directory.join("recovered.json");
+    let backup = directory.join("account.pigeon-backup.json");
+    let password = "correct horse battery staple";
+    run(
+        &client,
+        &[
+            "--state".into(),
+            original.display().to_string(),
+            "create-local".into(),
+            "--display-name".into(),
+            "Alice".into(),
+            "--password".into(),
+            password.into(),
+        ],
+    );
+    run(
+        &client,
+        &[
+            "--state".into(),
+            original.display().to_string(),
+            "export".into(),
+            "--output".into(),
+            backup.display().to_string(),
+            "--password".into(),
+            password.into(),
+        ],
+    );
+    let wrong = Command::new(&client)
+        .args([
+            "--state",
+            recovered.to_str().unwrap(),
+            "import",
+            "--input",
+            backup.to_str().unwrap(),
+            "--password",
+            "wrong password never works",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    run(
+        &client,
+        &[
+            "--state".into(),
+            recovered.display().to_string(),
+            "import".into(),
+            "--input".into(),
+            backup.display().to_string(),
+            "--password".into(),
+            password.into(),
+        ],
+    );
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(original).unwrap()).unwrap();
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&fs::read(recovered).unwrap()).unwrap();
+    assert_eq!(
+        original["authorized_devices"]["identity"],
+        recovered["authorized_devices"]["identity"]
+    );
+    assert_ne!(
+        original["device"]["device_id"],
+        recovered["device"]["device_id"]
+    );
+    assert_eq!(recovered["history"].as_array().unwrap().len(), 0);
+    assert_eq!(recovered["mls_conversations"].as_object().unwrap().len(), 0);
+    assert!(!fs::read_to_string(backup)
+        .unwrap()
+        .contains("signing_secret"));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
+    let _guard = relay_test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let server_bin = root.join("target/debug/pigeon-server");
     if !server_bin.exists() {
@@ -122,7 +215,15 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
         &client_args(
             &existing,
             &certificate,
-            vec!["create".into(), "--server".into(), address.into()],
+            vec![
+                "create".into(),
+                "--server".into(),
+                address.into(),
+                "--display-name".into(),
+                "Existing".into(),
+                "--password".into(),
+                "correct horse battery staple".into(),
+            ],
         ),
     ));
     let pairing_request = run(
@@ -150,7 +251,12 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
         &client_args(
             &existing,
             &certificate,
-            vec!["pair-approve".into(), pairing_request.trim().into()],
+            vec![
+                "pair-approve".into(),
+                pairing_request.trim().into(),
+                "--password".into(),
+                "correct horse battery staple".into(),
+            ],
         ),
     );
     run(
@@ -190,6 +296,7 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
 
 #[test]
 fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
+    let _guard = relay_test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let server_bin = root.join("target/debug/pigeon-server");
     if !server_bin.exists() {
@@ -236,6 +343,10 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
             "create".into(),
             "--server".into(),
             a.into(),
+            "--display-name".into(),
+            "Alice".into(),
+            "--password".into(),
+            "correct horse battery staple".into(),
         ],
     ));
     let bob_id = id(&run(
@@ -248,6 +359,10 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
             "create".into(),
             "--server".into(),
             b.into(),
+            "--display-name".into(),
+            "Bob".into(),
+            "--password".into(),
+            "correct horse battery staple".into(),
         ],
     ));
     let bob_card = run(
@@ -390,6 +505,7 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
 
 #[test]
 fn ownerless_group_membership_and_messages_cross_three_relays() {
+    let _guard = relay_test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let server_bin = root.join("target/debug/pigeon-server");
     if !server_bin.exists() {
@@ -432,7 +548,15 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
         &client_args(
             &alice,
             &directory.join("a.der"),
-            vec!["create".into(), "--server".into(), a.into()],
+            vec![
+                "create".into(),
+                "--server".into(),
+                a.into(),
+                "--display-name".into(),
+                "Alice".into(),
+                "--password".into(),
+                "correct horse battery staple".into(),
+            ],
         ),
     ));
     let bob_id = id(&run(
@@ -440,7 +564,15 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
         &client_args(
             &bob,
             &directory.join("b.der"),
-            vec!["create".into(), "--server".into(), b.into()],
+            vec![
+                "create".into(),
+                "--server".into(),
+                b.into(),
+                "--display-name".into(),
+                "Bob".into(),
+                "--password".into(),
+                "correct horse battery staple".into(),
+            ],
         ),
     ));
     let carol_id = id(&run(
@@ -448,7 +580,15 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
         &client_args(
             &carol,
             &directory.join("c.der"),
-            vec!["create".into(), "--server".into(), c.into()],
+            vec![
+                "create".into(),
+                "--server".into(),
+                c.into(),
+                "--display-name".into(),
+                "Carol".into(),
+                "--password".into(),
+                "correct horse battery staple".into(),
+            ],
         ),
     ));
     let alice_card = run(

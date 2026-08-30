@@ -19,9 +19,10 @@ Pigeon is a sovereign, end-to-end encrypted communication platform designed so t
 Pigeon separates **identity**, **routing**, **recent synchronization**, and **long-term history**.
 
 - A user's identity is a stable cryptographic identity and is not tied to a server.
-- Users control a portable backup of their root identity material.
-  Importing it on a new device restores authority over that identity, but does
-  not by itself recreate history that was not retained locally or backed up.
+- Users control a portable, password-encrypted backup containing root and
+  independent recovery authority. Import always creates a fresh device through
+  a recovery-authorized roster transition; it does not recreate history or MLS
+  epoch secrets that were not explicitly retained or backed up.
 - A user's current server is mutable signed routing metadata.
 - Contacts exchange self-authenticating signed contact cards containing a
   public identity and current routing record. QR codes, copyable links/text,
@@ -76,6 +77,7 @@ The client core should remain independent of Tauri so communication, identity, c
 - [Sovereign identity and peer-discovered routing](docs/architecture/0002-sovereign-identity-and-peer-discovery.md)
 - [Devices, groups, relay, and first milestone](docs/architecture/0003-devices-groups-relay-and-first-milestone.md)
 - [Secure add-device authorization and bootstrap](docs/architecture/0005-secure-add-device-bootstrap.md)
+- [Immutable account genesis and recovery-gated authority](docs/architecture/0006-account-genesis-and-recovery-authority.md)
 
 ## Status
 

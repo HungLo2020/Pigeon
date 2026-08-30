@@ -2,9 +2,10 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use pigeon_shared::{
-    decode, encode, identity_id, make_relay_forward, routing_precedes, tls_spki_fingerprint,
-    verify_card, verify_device, verify_relay_forward, verify_revocation, verify_routing,
-    DeviceRevocation, PairingArtifactKind, RelayDescriptor, Request, Response, RoutingRecord,
+    decode, encode, identity_id, make_relay_forward, roster_hash, routing_precedes,
+    tls_spki_fingerprint, verify_card, verify_device_with_genesis, verify_relay_forward,
+    verify_revocation, verify_roster_transition, verify_routing, DeviceRevocation,
+    PairingArtifactKind, RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};

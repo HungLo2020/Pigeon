@@ -6,14 +6,12 @@ Accepted.
 
 ## Identity backup and accounts on devices
 
-- An identity backup is portable cryptographic identity material, not a
-  password-derived server account.
-- Exporting it must not require a passphrase. The client should strongly
-  recommend that a user export it immediately after identity creation and
-  store it in a safe, secure location.
-- Importing an identity backup on a new device immediately grants that device
-  authority to act for the restored identity and authorizes the device under
-  that identity.
+- An identity backup is a portable, versioned encrypted recovery artifact, not
+  a password-derived server account. Its password locally unwraps an
+  independently random recovery authority; relays never receive or verify it.
+- Importing creates a fresh device credential and recovery-authorized roster
+  transition. It never clones an old device credential, MLS signer, runtime,
+  or local history.
 - The imported identity includes its current server routing information; setup
   connects the restored account to that server.
 - A physical device may host multiple independent Pigeon accounts. Each
@@ -22,8 +20,8 @@ Accepted.
   account, never as a device-wide setting; importing one account must not
   change the server used by another account already present on that device.
 
-The backup is equivalent to possession of the root authority. The product must
-make this consequence clear without requiring a passphrase for export.
+The backup is recovery authority protected by a user password. Root-key
+possession alone cannot enroll a new endpoint into an established account.
 
 Authorized devices are equal peers: each holds the root identity private key
 and a distinct device credential. Revoking a device removes its credential

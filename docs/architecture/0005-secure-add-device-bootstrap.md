@@ -25,10 +25,11 @@ current wire format or implement pairing.
 - Every authorized device is an equal peer: it holds the same root identity
   private key plus its own distinct device private key, `DeviceRecord`, MLS
   credential/KeyPackage, and local state. No device is a privileged master.
-- An **approving device** is any already-authorized equal peer that explicitly
-  uses its locally held root authority to sign a new `DeviceRecord`.
-- A **root recovery authority** may perform the same approval only after an
-  explicit root-backup import. A root backup is not embedded in pairing data.
+- An **approving device** is any already-authorized peer that signs the exact
+  roster transition with its distinct device credential. Normal approval also
+  requires the independent recovery authority unlocked by the account password.
+- A **recovery authority** may create the distinct recovery transition after an
+  encrypted backup import. Root authority by itself is never sufficient.
 - A relay may store and forward opaque pairing artifacts, but it cannot create
   an approval, modify an artifact successfully, decrypt bootstrap data, or
   grant a device authority.
@@ -83,7 +84,8 @@ nonce/session freshness, and the MLS KeyPackage before asking root authority
 to create a `DeviceRecord`. The root signature covers the fresh device key and
 KeyPackage through the existing `DeviceRecord` format.
 
-The resulting `PairingApproval` is root-signed and binds, in a canonical
+The resulting `PairingApproval` is root-signed and its referenced roster also
+binds recovery and authorized-device signatures in a canonical
 versioned signed payload:
 
 - root identity;

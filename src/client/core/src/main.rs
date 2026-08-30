@@ -1,19 +1,25 @@
 use ::tls_codec::Deserialize as _;
 use ::tls_codec::Serialize as _;
 use anyhow::{bail, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
-    capability_commitment, decode, encode, identity_id, make_card, make_card_named,
-    make_card_with_devices_named, make_device, make_pairing_approval, make_revocation,
-    make_routing, open_bootstrap, seal_bootstrap, verify_device_set, verify_pairing_approval,
-    verify_pairing_request, AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord,
-    DeviceRevocation, EncryptedBootstrap, PairingApproval, PairingArtifactKind,
-    PairingRelayArtifact, PairingRequest, RelayDescriptor, Request, Response, RoutingRecord,
+    account_id, capability_commitment, decode, encode, identity_id, make_authorized_device_set,
+    make_card_from_roster, make_device, make_pairing_approval, make_revocation, make_routing,
+    open_bootstrap, roster_hash, seal_bootstrap, verify_device_set, verify_pairing_approval,
+    verify_pairing_request, verify_roster_transition, AccountTransitionKind, AuthorizedDeviceSet,
+    BootstrapPayload, ContactCard, DeviceRecord, DeviceRevocation, EncryptedBootstrap,
+    PairingApproval, PairingArtifactKind, PairingRelayArtifact, PairingRequest,
+    PigeonAccountGenesis, RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -48,6 +54,10 @@ struct State {
     #[serde(default)]
     state_version: u8,
     signing_secret: [u8; 32],
+    /// The current endpoint's distinct private device credential. It is never
+    /// exported or copied through pairing/backup.
+    device_secret: [u8; 32],
+    recovery_wrap: PasswordWrappedRecovery,
     encryption_secret: [u8; 32],
     card: ContactCard,
     contacts: Vec<ContactCard>,
@@ -80,6 +90,93 @@ struct State {
     #[serde(default)]
     read_at: HashMap<String, i64>,
 }
+const ACCOUNT_STATE_VERSION: u8 = 2;
+const RECOVERY_WRAP_VERSION: u8 = 1;
+#[derive(Clone, Serialize, Deserialize)]
+struct PasswordWrappedRecovery {
+    version: u8,
+    salt: [u8; 16],
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+const PORTABLE_BACKUP_VERSION: u8 = 1;
+#[derive(Serialize, Deserialize)]
+struct EncryptedPortableBackup {
+    version: u8,
+    salt: [u8; 16],
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+#[derive(Serialize, Deserialize)]
+struct PortableBackupPayload {
+    version: u8,
+    genesis: PigeonAccountGenesis,
+    root_secret: [u8; 32],
+    recovery_secret: [u8; 32],
+    encryption_secret: [u8; 32],
+    card: ContactCard,
+    authorized_devices: AuthorizedDeviceSet,
+    revocations: Vec<DeviceRevocation>,
+    routing: Option<RoutingRecord>,
+    pending_routing: Vec<RoutingRecord>,
+    cached_routes: HashMap<String, RoutingRecord>,
+    contacts: Vec<ContactCard>,
+    nicknames: HashMap<String, String>,
+    groups: HashMap<String, GroupState>,
+}
+fn backup_aad() -> &'static [u8] {
+    b"pigeon-portable-account-backup-v1"
+}
+fn encrypt_backup(
+    password: &str,
+    payload: &PortableBackupPayload,
+) -> Result<EncryptedPortableBackup> {
+    let mut salt = [0; 16];
+    let mut nonce = [0; 24];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new((&password_key(password, &salt)?).into());
+    Ok(EncryptedPortableBackup {
+        version: PORTABLE_BACKUP_VERSION,
+        salt,
+        nonce,
+        ciphertext: cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: &encode(payload)?,
+                    aad: backup_aad(),
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("could not encrypt portable backup"))?,
+    })
+}
+fn decrypt_backup(
+    password: &str,
+    backup: &EncryptedPortableBackup,
+) -> Result<PortableBackupPayload> {
+    if backup.version != PORTABLE_BACKUP_VERSION {
+        bail!("unsupported portable backup format")
+    }
+    let cipher = XChaCha20Poly1305::new((&password_key(password, &backup.salt)?).into());
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&backup.nonce),
+            chacha20poly1305::aead::Payload {
+                msg: &backup.ciphertext,
+                aad: backup_aad(),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("incorrect backup password or corrupt encrypted backup"))?;
+    let payload: PortableBackupPayload = decode(&plaintext)?;
+    if payload.version != PORTABLE_BACKUP_VERSION
+        || account_id(&payload.genesis)? != identity_id(&payload.card)
+        || payload.authorized_devices.genesis != payload.genesis
+    {
+        bail!("portable backup account state is malformed")
+    }
+    Ok(payload)
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct LocalMessage {
     conversation: String,
@@ -109,6 +206,50 @@ struct PendingPairing {
 struct BootstrapControl {
     encryption_secret: [u8; 32],
     card: ContactCard,
+    recovery_wrap: PasswordWrappedRecovery,
+}
+fn password_key(password: &str, salt: &[u8; 16]) -> Result<[u8; 32]> {
+    if password.chars().count() < 12 {
+        bail!("account password must contain at least 12 characters")
+    }
+    let params = Params::new(19 * 1024, 2, 1, Some(32))
+        .map_err(|error| anyhow::anyhow!("invalid Argon2id parameters: {error}"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut output = [0; 32];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut output)
+        .map_err(|error| anyhow::anyhow!("Argon2id password derivation failed: {error}"))?;
+    Ok(output)
+}
+fn wrap_recovery(password: &str, recovery_secret: [u8; 32]) -> Result<PasswordWrappedRecovery> {
+    let mut salt = [0; 16];
+    let mut nonce = [0; 24];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new((&password_key(password, &salt)?).into());
+    Ok(PasswordWrappedRecovery {
+        version: RECOVERY_WRAP_VERSION,
+        salt,
+        nonce,
+        ciphertext: cipher
+            .encrypt(XNonce::from_slice(&nonce), recovery_secret.as_slice())
+            .map_err(|_| anyhow::anyhow!("could not encrypt recovery material"))?,
+    })
+}
+fn unwrap_recovery(password: &str, wrapped: &PasswordWrappedRecovery) -> Result<[u8; 32]> {
+    if wrapped.version != RECOVERY_WRAP_VERSION {
+        bail!("unsupported password-wrapped recovery format")
+    }
+    let cipher = XChaCha20Poly1305::new((&password_key(password, &wrapped.salt)?).into());
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&wrapped.nonce),
+            wrapped.ciphertext.as_ref(),
+        )
+        .map_err(|_| anyhow::anyhow!("incorrect account password or corrupt recovery material"))?;
+    plaintext
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid recovery secret length"))
 }
 #[derive(Serialize)]
 struct DiscoveredRelay {
@@ -129,14 +270,18 @@ struct Args {
 #[derive(Subcommand, Clone)]
 enum Command {
     CreateLocal {
-        #[arg(long, default_value = "Unnamed")]
+        #[arg(long)]
         display_name: String,
+        #[arg(long)]
+        password: String,
     },
     Create {
         #[arg(long)]
         server: String,
-        #[arg(long, default_value = "Unnamed")]
+        #[arg(long)]
         display_name: String,
+        #[arg(long)]
+        password: String,
     },
     ConfigureRelay {
         #[arg(long)]
@@ -156,15 +301,25 @@ enum Command {
     Export {
         #[arg(long)]
         output: String,
+        #[arg(long)]
+        password: String,
     },
     Import {
         #[arg(long)]
         input: String,
+        #[arg(long)]
+        password: String,
     },
     Card,
     SetDisplayName {
         #[arg(long)]
         display_name: String,
+    },
+    ChangePassword {
+        #[arg(long)]
+        old_password: String,
+        #[arg(long)]
+        new_password: String,
     },
     SetNickname {
         #[arg(long)]
@@ -211,6 +366,8 @@ enum Command {
     RevokeDevice {
         /// Hex-encoded stable device ID from the account's authorized roster.
         device_id: String,
+        #[arg(long)]
+        password: String,
     },
     PairRequest {
         #[arg(long)]
@@ -221,6 +378,8 @@ enum Command {
     PairApprove {
         /// Base64url pairing request emitted by `pair-request`.
         request: String,
+        #[arg(long)]
+        password: String,
     },
     PairConsume,
     PairCancel,
@@ -777,8 +936,24 @@ mod discovery_tests {
     #[test]
     fn route_descriptor_validation_rejects_fingerprint_substitution() {
         let root = SigningKey::generate(&mut OsRng);
-        let route =
-            pigeon_shared::make_routing(&root, "relay.example:8443".into(), [1; 32], [2; 32], 1, 0);
+        let recovery = SigningKey::generate(&mut OsRng);
+        let genesis = PigeonAccountGenesis {
+            version: pigeon_shared::ACCOUNT_GENESIS_VERSION,
+            root_public_key: root.verifying_key().to_bytes(),
+            initial_device_key: root.verifying_key().to_bytes(),
+            recovery_public_key: recovery.verifying_key().to_bytes(),
+            nonce: [9; 32],
+            initial_display_name: "Test".into(),
+        };
+        let route = pigeon_shared::make_routing(
+            &root,
+            genesis,
+            "relay.example:8443".into(),
+            [1; 32],
+            [2; 32],
+            1,
+            0,
+        );
         validate_route_descriptor(&route, &descriptor("relay.example:8443")).unwrap();
         assert!(validate_route_descriptor(
             &route,

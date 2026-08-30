@@ -6,23 +6,23 @@ Accepted.
 
 ## Decision
 
-Pigeon identity is a long-lived cryptographic root of authority owned by the
-user, not by a server, phone number, email provider, directory, or username
-service.
+Pigeon identity is an immutable versioned account genesis owned by the user,
+not by a server, phone number, email provider, directory, or username service.
 
-- The root identity key authorizes devices, signs routing records, and governs
-  recovery, device authorization, and revocation.
-- Users must be able to export a portable identity backup containing the root
-  identity material and restore it in order to regain control of their
+- The root identity key signs records, but the stable account ID is derived
+  from canonical genesis rather than the root key. Established-account device
+  enrollment additionally requires recovery authority and an authorized-device
+  approval; root-key possession alone is not takeover authority.
+- Users must be able to export a password-encrypted portable backup containing
+  root and independent recovery material and restore it in order to regain control of their
   Pigeon identity after device loss.
-- Restoring an identity restores authority over the identity and its future
-  device/contact relationships. It does not guarantee reconstruction of
+- Restoring creates a fresh device through the recovery transition. It does not guarantee reconstruction of
   message history outside retained local history, a user-controlled backup, or
   the server's bounded synchronization window.
 - New devices are normally authorized by QR transfer or approval from an
-  existing authorized device. Importing an identity backup is a
-  fallback when no such device is available; the restored root authority then
-  authorizes the new device.
+  existing authorized device plus password-unlocked recovery authority.
+  Importing an encrypted identity backup is a fallback when no such device is
+  available; it performs the distinct recovery authorization transition.
 
 ## No bootstrap directory
 

@@ -16,7 +16,15 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         _ => None,
     };
     match args.command {
-        Command::CreateLocal { display_name } | Command::Create { display_name, .. } => {
+        Command::CreateLocal {
+            display_name,
+            password,
+        }
+        | Command::Create {
+            display_name,
+            password,
+            ..
+        } => {
             if std::path::Path::new(&args.state).exists() {
                 bail!("identity already exists: {}", args.state)
             };
@@ -27,28 +35,51 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let signing = SigningKey::from_bytes(&signing_secret);
             let encryption = StaticSecret::from(encryption_secret);
             let device_signing = SigningKey::generate(&mut OsRng);
+            let mut recovery_secret = [0; 32];
+            OsRng.fill_bytes(&mut recovery_secret);
+            let recovery = SigningKey::from_bytes(&recovery_secret);
             let (mls_key_package, mls_signer, mls_storage) =
                 create_mls_identity(&device_signing.verifying_key().to_bytes())?;
-            let device = make_device(&signing, &device_signing, mls_key_package);
-            let server = requested_create_server.unwrap_or_default();
+            let mut nonce = [0; 32];
+            OsRng.fill_bytes(&mut nonce);
             if display_name.trim().is_empty() {
                 bail!("display name is required")
             }
-            let card = make_card_named(
+            let genesis = PigeonAccountGenesis {
+                version: pigeon_shared::ACCOUNT_GENESIS_VERSION,
+                root_public_key: signing.verifying_key().to_bytes(),
+                initial_device_key: device_signing.verifying_key().to_bytes(),
+                recovery_public_key: recovery.verifying_key().to_bytes(),
+                nonce,
+                initial_display_name: display_name.trim().into(),
+            };
+            let identity = account_id(&genesis)?;
+            let device = make_device(&signing, identity, &device_signing, mls_key_package);
+            let server = requested_create_server.unwrap_or_default();
+            let authorized_devices = make_authorized_device_set(
+                genesis.clone(),
                 &signing,
+                &recovery,
+                vec![device.clone()],
+                1,
+                None,
+                None,
+                AccountTransitionKind::Genesis,
+            )?;
+            let card = make_card_from_roster(
+                &signing,
+                genesis,
                 &encryption,
                 server.clone(),
-                device.clone(),
+                authorized_devices.clone(),
+                1,
                 display_name.trim().into(),
-            );
-            let authorized_devices = AuthorizedDeviceSet {
-                identity: identity_id(&card),
-                revision: 1,
-                devices: vec![device.clone()],
-            };
+            )?;
             let state = State {
-                state_version: 1,
+                state_version: ACCOUNT_STATE_VERSION,
                 signing_secret,
+                device_secret: device_signing.to_bytes(),
+                recovery_wrap: wrap_recovery(&password, recovery_secret)?,
                 encryption_secret,
                 card: card.clone(),
                 contacts: vec![],
@@ -90,6 +121,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let descriptor = relay_descriptor(&server, &args.certificate).await?;
             let route = make_routing(
                 &signing,
+                state.card.genesis.clone(),
                 server.clone(),
                 descriptor.identity,
                 descriptor.tls_spki_fingerprint,
@@ -139,9 +171,18 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let server = descriptor.address.clone();
             let signing = SigningKey::from_bytes(&state.signing_secret);
             let encryption = StaticSecret::from(state.encryption_secret);
-            let card = make_card(&signing, &encryption, server.clone(), state.device.clone());
+            let card = make_card_from_roster(
+                &signing,
+                state.card.genesis.clone(),
+                &encryption,
+                server.clone(),
+                state.authorized_devices.clone(),
+                state.card.revision + 1,
+                state.card.display_name.clone(),
+            )?;
             let route = make_routing(
                 &signing,
+                state.card.genesis.clone(),
                 server,
                 descriptor.identity,
                 descriptor.tls_spki_fingerprint,
@@ -164,28 +205,112 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             state.routing = Some(route);
             save(&args.state, &state)?;
         }
-        Command::Export { output } => {
+        Command::Export { output, password } => {
             let state = load(&args.state)?;
-            save(&output, &state)?;
-            eprintln!(
-                "WARNING: this unencrypted identity backup authorizes a device. Store it securely."
-            );
+            let recovery_secret = unwrap_recovery(&password, &state.recovery_wrap)?;
+            let backup = encrypt_backup(
+                &password,
+                &PortableBackupPayload {
+                    version: PORTABLE_BACKUP_VERSION,
+                    genesis: state.card.genesis.clone(),
+                    root_secret: state.signing_secret,
+                    recovery_secret,
+                    encryption_secret: state.encryption_secret,
+                    card: state.card.clone(),
+                    authorized_devices: state.authorized_devices.clone(),
+                    revocations: state.revocations.clone(),
+                    routing: state.routing.clone(),
+                    pending_routing: state.pending_routing.clone(),
+                    cached_routes: state.cached_routes.clone(),
+                    contacts: state.contacts.clone(),
+                    nicknames: state.nicknames.clone(),
+                    groups: state.groups.clone(),
+                },
+            )?;
+            fs::write(&output, serde_json::to_vec_pretty(&backup)?)?;
             println!("exported {output}");
         }
-        Command::Import { input } => {
-            let state = load(&input)?;
-            response_ok(
-                account_request(
-                    &state,
-                    &args.certificate,
-                    Request::Register {
-                        card: state.card.clone(),
-                        device: state.device.clone(),
-                        device_signature: vec![],
-                    },
-                )
-                .await?,
+        Command::Import { input, password } => {
+            if std::path::Path::new(&args.state).exists() {
+                bail!("refusing to overwrite an existing local account state")
+            }
+            let encrypted: EncryptedPortableBackup = serde_json::from_slice(&fs::read(&input)?)?;
+            let backup = decrypt_backup(&password, &encrypted)?;
+            let root = SigningKey::from_bytes(&backup.root_secret);
+            if root.verifying_key().to_bytes() != backup.genesis.root_public_key {
+                bail!("portable backup root authority does not match its immutable genesis")
+            }
+            let recovery = SigningKey::from_bytes(&backup.recovery_secret);
+            if recovery.verifying_key().to_bytes() != backup.genesis.recovery_public_key {
+                bail!("portable backup recovery authority does not match its immutable genesis")
+            }
+            let device_signing = SigningKey::generate(&mut OsRng);
+            let (mls_key_package, mls_signer, mls_storage) =
+                create_mls_identity(&device_signing.verifying_key().to_bytes())?;
+            let fresh_device = make_device(
+                &root,
+                account_id(&backup.genesis)?,
+                &device_signing,
+                mls_key_package,
+            );
+            let mut devices = backup.authorized_devices.devices.clone();
+            devices.push(fresh_device.clone());
+            let roster = make_authorized_device_set(
+                backup.genesis.clone(),
+                &root,
+                &recovery,
+                devices,
+                backup.authorized_devices.revision + 1,
+                Some(&backup.authorized_devices),
+                None,
+                AccountTransitionKind::Recovery,
             )?;
+            let card = make_card_from_roster(
+                &root,
+                backup.genesis.clone(),
+                &StaticSecret::from(backup.encryption_secret),
+                backup.card.server.clone(),
+                roster.clone(),
+                backup.card.revision + 1,
+                backup.card.display_name.clone(),
+            )?;
+            let state = State {
+                state_version: ACCOUNT_STATE_VERSION,
+                signing_secret: backup.root_secret,
+                device_secret: device_signing.to_bytes(),
+                recovery_wrap: wrap_recovery(&password, backup.recovery_secret)?,
+                encryption_secret: backup.encryption_secret,
+                card,
+                contacts: backup.contacts,
+                nicknames: backup.nicknames,
+                mls_storage,
+                mls_conversations: HashMap::new(),
+                direct_groups: HashMap::new(),
+                mls_signer,
+                device: fresh_device.clone(),
+                authorized_devices: roster,
+                revocations: backup.revocations,
+                routing: backup.routing,
+                pending_routing: backup.pending_routing,
+                cached_routes: backup.cached_routes,
+                groups: backup.groups,
+                history: vec![],
+                read_at: HashMap::new(),
+            };
+            if state.routing.is_some() || !state.card.server.trim().is_empty() {
+                response_ok(
+                    account_request(
+                        &state,
+                        &args.certificate,
+                        Request::Register {
+                            card: state.card.clone(),
+                            device: fresh_device,
+                            device_signature: vec![],
+                        },
+                    )
+                    .await?,
+                )?;
+            }
             save(&args.state, &state)?;
             println!(
                 "imported identity: {}",
@@ -271,6 +396,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         }
         Command::PairApprove {
             request: request_text,
+            password,
         } => {
             let mut state = load(&args.state)?;
             let pairing_request: PairingRequest =
@@ -281,9 +407,16 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 bail!("pairing request is for a different identity")
             }
             let root = SigningKey::from_bytes(&state.signing_secret);
+            let recovery =
+                SigningKey::from_bytes(&unwrap_recovery(&password, &state.recovery_wrap)?);
+            let approving_device = SigningKey::from_bytes(&state.device_secret);
             let revision = state.authorized_devices.revision + 1;
-            let provisional =
-                pigeon_shared::authorize_pairing_device(&root, &pairing_request.device, revision);
+            let provisional = pigeon_shared::authorize_pairing_device(
+                &root,
+                &state.card.genesis,
+                &pairing_request.device,
+                revision,
+            );
             if state
                 .authorized_devices
                 .devices
@@ -292,18 +425,27 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             {
                 bail!("pairing device is already authorized")
             }
-            let mut roster = state.authorized_devices.clone();
-            roster.revision = revision;
-            roster.devices.push(provisional);
-            verify_device_set(&roster)?;
-            let card = make_card_with_devices_named(
+            let mut devices = state.authorized_devices.devices.clone();
+            devices.push(provisional);
+            let roster = make_authorized_device_set(
+                state.card.genesis.clone(),
                 &root,
+                &recovery,
+                devices,
+                revision,
+                Some(&state.authorized_devices),
+                Some((&approving_device, state.device.device_id)),
+                AccountTransitionKind::DeviceAndRecovery,
+            )?;
+            let card = make_card_from_roster(
+                &root,
+                state.card.genesis.clone(),
                 &StaticSecret::from(state.encryption_secret),
                 state.card.server.clone(),
-                roster.devices.clone(),
+                roster.clone(),
                 state.card.revision + 1,
                 state.card.display_name.clone(),
-            );
+            )?;
             let bootstrap = BootstrapPayload {
                 version: pigeon_shared::PAIRING_VERSION,
                 root_secret: state.signing_secret,
@@ -313,6 +455,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 control_state: encode(&BootstrapControl {
                     encryption_secret: state.encryption_secret,
                     card: card.clone(),
+                    recovery_wrap: state.recovery_wrap.clone(),
                 })?,
                 // Existing device MLS private state and history are deliberately excluded.
                 mls_bootstrap: vec![],
@@ -433,8 +576,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 bail!("bootstrap card identity mismatch")
             }
             let state = State {
-                state_version: 1,
+                state_version: ACCOUNT_STATE_VERSION,
                 signing_secret: bootstrap.root_secret,
+                device_secret: pending.device_secret,
+                recovery_wrap: control.recovery_wrap,
                 encryption_secret: control.encryption_secret,
                 card: control.card,
                 contacts: bootstrap.contacts,
@@ -495,14 +640,15 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             }
             let mut state = load(&args.state)?;
             let root = SigningKey::from_bytes(&state.signing_secret);
-            state.card = make_card_with_devices_named(
+            state.card = make_card_from_roster(
                 &root,
+                state.card.genesis.clone(),
                 &StaticSecret::from(state.encryption_secret),
                 state.card.server.clone(),
-                state.authorized_devices.devices.clone(),
+                state.authorized_devices.clone(),
                 state.card.revision + 1,
                 display_name.trim().into(),
-            );
+            )?;
             response_ok(
                 account_request(
                     &state,
@@ -516,6 +662,16 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .await?,
             )?;
             save(&args.state, &state)?;
+        }
+        Command::ChangePassword {
+            old_password,
+            new_password,
+        } => {
+            let mut state = load(&args.state)?;
+            let recovery = unwrap_recovery(&old_password, &state.recovery_wrap)?;
+            state.recovery_wrap = wrap_recovery(&new_password, recovery)?;
+            save(&args.state, &state)?;
+            println!("account password changed");
         }
         Command::SetNickname { identity, nickname } => {
             let mut state = load(&args.state)?;
@@ -863,7 +1019,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             save(&args.state, &state)?;
             println!("member removed");
         }
-        Command::RevokeDevice { device_id } => {
+        Command::RevokeDevice {
+            device_id,
+            password,
+        } => {
             let mut state = load(&args.state)?;
             let bytes = hex::decode(device_id)?;
             let device_id: [u8; 32] = bytes
@@ -881,6 +1040,9 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 bail!("device is not in this identity's authorized roster")
             }
             let root = SigningKey::from_bytes(&state.signing_secret);
+            let recovery =
+                SigningKey::from_bytes(&unwrap_recovery(&password, &state.recovery_wrap)?);
+            let approving_device = SigningKey::from_bytes(&state.device_secret);
             let revision = state
                 .revocations
                 .iter()
@@ -888,7 +1050,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .max()
                 .unwrap_or(0)
                 + 1;
-            let revocation = make_revocation(&root, device_id, revision);
+            let revocation =
+                make_revocation(&root, state.card.genesis.clone(), device_id, revision);
             response_ok(
                 account_request(
                     &state,
@@ -975,19 +1138,32 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             }
             persist_mls(&mut state, &provider)?;
             state.revocations.push(revocation);
-            state
-                .authorized_devices
-                .devices
-                .retain(|device| device.device_id != device_id);
-            state.authorized_devices.revision += 1;
-            state.card = make_card_with_devices_named(
+            let roster = make_authorized_device_set(
+                state.card.genesis.clone(),
                 &root,
+                &recovery,
+                state
+                    .authorized_devices
+                    .devices
+                    .iter()
+                    .filter(|device| device.device_id != device_id)
+                    .cloned()
+                    .collect(),
+                state.authorized_devices.revision + 1,
+                Some(&state.authorized_devices),
+                Some((&approving_device, state.device.device_id)),
+                AccountTransitionKind::DeviceAndRecovery,
+            )?;
+            state.authorized_devices = roster.clone();
+            state.card = make_card_from_roster(
+                &root,
+                state.card.genesis.clone(),
                 &StaticSecret::from(state.encryption_secret),
                 state.card.server.clone(),
-                state.authorized_devices.devices.clone(),
+                roster,
                 state.card.revision + 1,
                 state.card.display_name.clone(),
-            );
+            )?;
             save(&args.state, &state)?;
             println!("device revoked");
         }
@@ -1010,16 +1186,18 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .as_ref()
                 .map(|route| route.revision)
                 .unwrap_or(state.card.revision);
-            let card = make_card_with_devices_named(
+            let card = make_card_from_roster(
                 &root,
+                state.card.genesis.clone(),
                 &StaticSecret::from(state.encryption_secret),
                 server.clone(),
-                state.authorized_devices.devices.clone(),
+                state.authorized_devices.clone(),
                 state.card.revision + 1,
                 state.card.display_name.clone(),
-            );
+            )?;
             let route = make_routing(
                 &root,
+                state.card.genesis.clone(),
                 server.clone(),
                 descriptor.identity,
                 descriptor.tls_spki_fingerprint,
@@ -1173,12 +1351,31 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                 .position(|contact| identity_id(contact) == sender_identity)
                             {
                                 Some(index) if card.revision > state.contacts[index].revision => {
+                                    let current = &state.contacts[index];
+                                    if card.genesis != current.genesis {
+                                        bail!("contact profile update changes immutable account genesis")
+                                    }
+                                    if card.authorized_devices.revision
+                                        > current.authorized_devices.revision
+                                    {
+                                        verify_roster_transition(
+                                            &current.authorized_devices,
+                                            &card.authorized_devices,
+                                        )?;
+                                    } else if roster_hash(&card.authorized_devices)
+                                        != roster_hash(&current.authorized_devices)
+                                    {
+                                        bail!("contact profile update conflicts with the authenticated roster")
+                                    }
                                     state.contacts[index] = card.clone();
                                 }
                                 None => state.contacts.push(card.clone()),
                                 _ => {}
                             }
-                            if route.identity != sender_identity || route.server != card.server {
+                            if route.identity != sender_identity
+                                || route.genesis != card.genesis
+                                || route.server != card.server
+                            {
                                 bail!("sender routing record does not match sender contact card")
                             }
                             validate_route_descriptor(
@@ -1338,14 +1535,15 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                         bail!("received stale or unrelated MOVED record")
                     }
                     let root = SigningKey::from_bytes(&state.signing_secret);
-                    state.card = make_card_with_devices_named(
+                    state.card = make_card_from_roster(
                         &root,
+                        state.card.genesis.clone(),
                         &StaticSecret::from(state.encryption_secret),
                         route.server.clone(),
-                        state.authorized_devices.devices.clone(),
+                        state.authorized_devices.clone(),
                         route.revision,
                         state.card.display_name.clone(),
-                    );
+                    )?;
                     state.routing = Some(route);
                     save(&args.state, &state)?;
                     println!("switched to the newer server route; run fetch again");

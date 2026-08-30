@@ -7,9 +7,11 @@ pub(super) fn load(path: &str) -> Result<State> {
     let state: State = serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read identity state {path}"))?,
     )?;
-    if state.routing.is_none() && state.state_version == 0 {
-        bail!("legacy identity state has no versioned relay-bound routing record; re-import from a current backup")
+    if state.state_version != super::ACCOUNT_STATE_VERSION {
+        bail!("legacy root-only account state is incompatible with account-genesis security. Export a new encrypted recovery backup from a current client, then import it; legacy state is never silently upgraded")
     }
+    pigeon_shared::verify_card(&state.card)?;
+    pigeon_shared::verify_device_set(&state.authorized_devices)?;
     Ok(state)
 }
 pub(super) fn save(path: &str, state: &State) -> Result<()> {

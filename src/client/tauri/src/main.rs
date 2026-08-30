@@ -159,7 +159,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let identity = value
-        .pointer("/card/signing_key")
+        .pointer("/authorized_devices/identity")
         .map(|key| hex_bytes(Some(key)));
     let server = value
         .pointer("/card/server")
@@ -172,7 +172,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .flatten()
         .filter_map(|card| {
             Some(Contact {
-                id: hex_bytes(card.get("signing_key")),
+                id: hex_bytes(card.pointer("/authorized_devices/identity")),
                 server: card.get("server")?.as_str()?.to_owned(),
                 display_name: card
                     .get("display_name")
@@ -408,7 +408,11 @@ fn pairing_status(app: &tauri::AppHandle) -> Result<Option<PairingStatus>, Strin
     }))
 }
 #[tauri::command]
-fn create_account(app: tauri::AppHandle, display_name: String) -> Result<(), String> {
+fn create_account(
+    app: tauri::AppHandle,
+    display_name: String,
+    password: String,
+) -> Result<(), String> {
     let id = format!(
         "account-{}",
         SystemTime::now()
@@ -424,12 +428,18 @@ fn create_account(app: tauri::AppHandle, display_name: String) -> Result<(), Str
     save_index(&app, &account_index)?;
     core(
         &app,
-        &["create-local".into(), "--display-name".into(), display_name],
+        &[
+            "create-local".into(),
+            "--display-name".into(),
+            display_name,
+            "--password".into(),
+            password,
+        ],
     )?;
     let value: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     account_index.accounts.push(AccountEntry {
         id,
         label: value
@@ -462,6 +472,38 @@ fn set_display_name(app: tauri::AppHandle, display_name: String) -> Result<(), S
         }
     }
     save_index(&app, &account_index)
+}
+#[tauri::command]
+fn change_password(
+    app: tauri::AppHandle,
+    old_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "change-password".into(),
+            "--old-password".into(),
+            old_password,
+            "--new-password".into(),
+            new_password,
+        ],
+    )
+    .map(|_| ())
+}
+#[tauri::command]
+fn export_account(app: tauri::AppHandle, output: String, password: String) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "export".into(),
+            "--output".into(),
+            output,
+            "--password".into(),
+            password,
+        ],
+    )
+    .map(|_| ())
 }
 #[tauri::command]
 fn set_nickname(
@@ -537,7 +579,7 @@ fn migrate_relay(app: tauri::AppHandle, server: String, descriptor: String) -> R
     .map(|_| ())
 }
 #[tauri::command]
-fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
+fn import_account(app: tauri::AppHandle, backup: String, password: String) -> Result<(), String> {
     let id = format!(
         "account-{}",
         SystemTime::now()
@@ -552,7 +594,16 @@ fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
     let previous_selected = account_index.selected.clone();
     account_index.selected = Some(id.clone());
     save_index(&app, &account_index)?;
-    if let Err(error) = core(&app, &["import".into(), "--input".into(), backup]) {
+    if let Err(error) = core(
+        &app,
+        &[
+            "import".into(),
+            "--input".into(),
+            backup,
+            "--password".into(),
+            password,
+        ],
+    ) {
         account_index.selected = previous_selected;
         save_index(&app, &account_index)?;
         let _ = fs::remove_file(&path);
@@ -561,7 +612,7 @@ fn import_account(app: tauri::AppHandle, backup: String) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     account_index.accounts.push(AccountEntry {
         id,
         label: value
@@ -632,8 +683,17 @@ fn pairing_request_details(request: String) -> Result<PairingRequestDetails, Str
     })
 }
 #[tauri::command]
-fn approve_pairing(app: tauri::AppHandle, request: String) -> Result<(), String> {
-    core(&app, &["pair-approve".into(), request]).map(|_| ())
+fn approve_pairing(app: tauri::AppHandle, request: String, password: String) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "pair-approve".into(),
+            request,
+            "--password".into(),
+            password,
+        ],
+    )
+    .map(|_| ())
 }
 #[tauri::command]
 fn consume_pairing(app: tauri::AppHandle) -> Result<(), String> {
@@ -647,7 +707,7 @@ fn consume_pairing(app: tauri::AppHandle) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    let identity = hex_bytes(value.pointer("/card/signing_key"));
+    let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     if let Some(account) = account_index
         .accounts
         .iter_mut()
@@ -691,7 +751,7 @@ fn mark_read(app: tauri::AppHandle, conversation: String) -> Result<(), String> 
     .map(|_| ())
 }
 #[tauri::command]
-fn revoke_device(app: tauri::AppHandle, device_id: String) -> Result<(), String> {
+fn revoke_device(app: tauri::AppHandle, device_id: String, password: String) -> Result<(), String> {
     if account_status(app.clone())?
         .devices
         .iter()
@@ -701,7 +761,13 @@ fn revoke_device(app: tauri::AppHandle, device_id: String) -> Result<(), String>
     }
     core(
         &app,
-        &["revoke-device".into(), "--device-id".into(), device_id],
+        &[
+            "revoke-device".into(),
+            "--device-id".into(),
+            device_id,
+            "--password".into(),
+            password,
+        ],
     )
     .map(|_| ())
 }
@@ -747,6 +813,8 @@ fn main() {
             account_status,
             create_account,
             set_display_name,
+            change_password,
+            export_account,
             set_nickname,
             set_appearance,
             select_account,
