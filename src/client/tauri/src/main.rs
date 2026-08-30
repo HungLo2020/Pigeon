@@ -14,10 +14,19 @@ use state_mapping::{hex_bytes, sort_conversations, unread_count};
 
 #[derive(Serialize, Clone)]
 struct Contact {
+    /// Canonical genesis selector used for commands and local state joins.
     id: String,
+    compact_id: String,
     server: String,
     display_name: String,
     nickname: Option<String>,
+}
+
+fn canonical_genesis_selector(value: Option<&serde_json::Value>) -> Option<String> {
+    let genesis: pigeon_shared::PigeonAccountGenesis =
+        serde_json::from_value(value?.clone()).ok()?;
+    let bytes = pigeon_shared::canonical_genesis_key(&genesis).ok()?;
+    Some(STANDARD_NO_PAD.encode(bytes))
 }
 #[derive(Serialize, Clone)]
 struct Group {
@@ -68,6 +77,7 @@ struct Message {
 struct AccountStatus {
     state_exists: bool,
     identity: Option<String>,
+    identity_anchor: Option<String>,
     server: Option<String>,
     contacts: Vec<Contact>,
     groups: Vec<Group>,
@@ -120,6 +130,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         return Ok(AccountStatus {
             state_exists: false,
             identity: None,
+            identity_anchor: None,
             server: None,
             contacts: vec![],
             groups: vec![],
@@ -140,6 +151,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         return Ok(AccountStatus {
             state_exists: false,
             identity: None,
+            identity_anchor: None,
             server: None,
             contacts: vec![],
             groups: vec![],
@@ -161,6 +173,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
     let identity = value
         .pointer("/authorized_devices/identity")
         .map(|key| hex_bytes(Some(key)));
+    let identity_anchor = canonical_genesis_selector(value.pointer("/card/genesis"));
     let server = value
         .pointer("/card/server")
         .and_then(|v| v.as_str())
@@ -172,7 +185,8 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .flatten()
         .filter_map(|card| {
             Some(Contact {
-                id: hex_bytes(card.pointer("/authorized_devices/identity")),
+                id: canonical_genesis_selector(card.get("genesis"))?,
+                compact_id: hex_bytes(card.pointer("/authorized_devices/identity")),
                 server: card.get("server")?.as_str()?.to_owned(),
                 display_name: card
                     .get("display_name")
@@ -181,7 +195,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
                     .to_owned(),
                 nickname: value
                     .get("nicknames")
-                    .and_then(|n| n.get(hex_bytes(card.get("signing_key"))))
+                    .and_then(|n| n.get(canonical_genesis_selector(card.get("genesis"))?))
                     .and_then(|v| v.as_str())
                     .map(ToOwned::to_owned),
             })
@@ -322,7 +336,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
                 .get(&id)
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or_default();
-            let unread = unread_count(&messages, identity.as_deref(), &id, cursor);
+            let unread = unread_count(&messages, identity_anchor.as_deref(), &id, cursor);
             Conversation {
                 id,
                 title,
@@ -345,6 +359,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
     Ok(AccountStatus {
         state_exists: true,
         identity,
+        identity_anchor,
         server,
         contacts,
         groups,
@@ -628,6 +643,7 @@ fn import_account(app: tauri::AppHandle, backup: String, password: String) -> Re
 fn begin_pairing(
     app: tauri::AppHandle,
     identity: String,
+    genesis: String,
     server: String,
 ) -> Result<String, String> {
     let id = format!(
@@ -652,6 +668,8 @@ fn begin_pairing(
             "pair-request".into(),
             "--identity".into(),
             identity,
+            "--genesis".into(),
+            genesis,
             "--server".into(),
             server,
         ],

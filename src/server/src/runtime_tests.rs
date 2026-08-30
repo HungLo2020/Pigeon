@@ -1,9 +1,9 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use pigeon_shared::{
-    account_id, make_authorized_device_set, make_card_from_roster, make_relay_forward,
-    AccountTransitionKind, DeviceRecord, MlsRecord, PairingArtifactKind, PairingRelayArtifact,
-    PigeonAccountGenesis,
+    account_id, account_identity, make_authorized_device_set, make_card_from_roster,
+    make_relay_forward, AccountTransitionKind, DeviceRecord, MlsRecord, PairingArtifactKind,
+    PairingRelayArtifact, PigeonAccountGenesis,
 };
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
@@ -165,9 +165,11 @@ fn pairing_artifact(
     capability: u8,
     payload: Vec<u8>,
 ) -> PairingRelayArtifact {
+    let account = pairing_account();
     PairingRelayArtifact {
         version: 1,
-        identity: [7; 32],
+        identity: account.compact_id,
+        genesis: account.genesis,
         session_id: [session; 16],
         nonce: [9; 16],
         kind,
@@ -175,6 +177,166 @@ fn pairing_artifact(
         capability_commitment: pigeon_shared::capability_commitment(&[capability; 32]),
         payload,
     }
+}
+
+fn pairing_account() -> pigeon_shared::AccountIdentity {
+    let root = SigningKey::from_bytes(&[7; 32]);
+    let recovery = SigningKey::from_bytes(&[8; 32]);
+    let device = SigningKey::from_bytes(&[9; 32]);
+    account_identity(PigeonAccountGenesis {
+        version: pigeon_shared::ACCOUNT_GENESIS_VERSION,
+        root_public_key: root.verifying_key().to_bytes(),
+        initial_device_key: device.verifying_key().to_bytes(),
+        recovery_public_key: recovery.verifying_key().to_bytes(),
+        nonce: [7; 32],
+        initial_display_name: "Pairing fixture".into(),
+    })
+    .unwrap()
+}
+
+fn account_for(card: &pigeon_shared::ContactCard) -> pigeon_shared::AccountIdentity {
+    account_identity(card.genesis.clone()).unwrap()
+}
+
+#[test]
+fn forced_compact_id_collision_keeps_canonical_accounts_and_relay_state_isolated() {
+    let database = Connection::open_in_memory().unwrap();
+    initialize(&database).unwrap();
+    let root_a = SigningKey::generate(&mut OsRng);
+    let root_b = SigningKey::generate(&mut OsRng);
+    let genesis_a = fixture_genesis(&root_a);
+    let genesis_b = fixture_genesis(&root_b);
+    assert_ne!(genesis_a, genesis_b);
+    pigeon_shared::force_compact_id_for_test(&genesis_a, [42; 32]).unwrap();
+    pigeon_shared::force_compact_id_for_test(&genesis_b, [42; 32]).unwrap();
+    let device_a_key = SigningKey::generate(&mut OsRng);
+    let device_b_key = SigningKey::generate(&mut OsRng);
+    let encryption_a = StaticSecret::random_from_rng(OsRng);
+    let encryption_b = StaticSecret::random_from_rng(OsRng);
+    let card_a = make_card(
+        &root_a,
+        &encryption_a,
+        "relay.test:8443".into(),
+        make_device(&root_a, &device_a_key, vec![1]),
+    );
+    let card_b = make_card(
+        &root_b,
+        &encryption_b,
+        "relay.test:8443".into(),
+        make_device(&root_b, &device_b_key, vec![2]),
+    );
+    assert_eq!(identity_id(&card_a), identity_id(&card_b));
+    assert_ne!(card_a.genesis, card_b.genesis);
+    for card in [&card_a, &card_b] {
+        assert!(matches!(
+            process(
+                &database,
+                Request::Register {
+                    card: card.clone(),
+                    device: card.devices[0].clone(),
+                    device_signature: vec![],
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM identities_v2 WHERE compact_id = ?1",
+                params![[42u8; 32].to_vec()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    let route_a = make_routing(&root_a, "relay-a.test:8443".into(), [1; 32], [2; 32], 1, 0);
+    let route_b = make_routing(&root_b, "relay-b.test:8443".into(), [3; 32], [4; 32], 1, 0);
+    assert!(matches!(
+        process(&database, Request::PublishRouting(route_a.clone())),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process(&database, Request::PublishRouting(route_b.clone())),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process(&database, Request::GetRouting { account: account_for(&card_a) }),
+        Response::Routing(Some(route)) if route == route_a
+    ));
+    assert!(matches!(
+        process(&database, Request::GetRouting { account: account_for(&card_b) }),
+        Response::Routing(Some(route)) if route == route_b
+    ));
+    let record = MlsRecord {
+        recipient: account_for(&card_a),
+        sender: account_for(&card_a),
+        sender_device: card_a.devices[0].device_id,
+        target_devices: vec![card_a.devices[0].device_id],
+        payload: vec![9, 9],
+    };
+    assert!(matches!(
+        process(&database, Request::SendMls(record)),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process(
+            &database,
+            Request::Fetch {
+                account: account_for(&card_b),
+                device_id: card_b.devices[0].device_id,
+                known_routing_revision: 1,
+            }
+        ),
+        Response::MlsMessages(messages) if messages.is_empty()
+    ));
+    let artifact = |card: &pigeon_shared::ContactCard, payload: Vec<u8>| PairingRelayArtifact {
+        version: pigeon_shared::PAIRING_VERSION,
+        identity: identity_id(card),
+        genesis: card.genesis.clone(),
+        session_id: [3; 16],
+        nonce: [4; 16],
+        kind: PairingArtifactKind::PublicRequest,
+        expires_at: 100,
+        capability_commitment: [5; 32],
+        payload,
+    };
+    assert!(matches!(
+        process_at(
+            &database,
+            Request::PublishPairingArtifact(artifact(&card_a, vec![1])),
+            1
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process_at(
+            &database,
+            Request::PublishPairingArtifact(artifact(&card_b, vec![2])),
+            1
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process_at(&database, Request::FetchPairingRequest { account: account_for(&card_b), session_id: [3; 16] }, 1),
+        Response::PairingArtifact(value) if value.payload == vec![2]
+    ));
+    let revocation = make_revocation(&root_a, card_a.devices[0].device_id, 2);
+    assert!(matches!(
+        process(&database, Request::RevokeDevice(revocation)),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process(
+            &database,
+            Request::Fetch {
+                account: account_for(&card_b),
+                device_id: card_b.devices[0].device_id,
+                known_routing_revision: 1,
+            }
+        ),
+        Response::MlsMessages(_)
+    ));
 }
 
 #[test]
@@ -187,13 +349,13 @@ fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
         Response::Ok
     ));
     assert!(
-        matches!(process_at(&db, Request::FetchPairingRequest { identity:[7;32], session_id:[1;16] }, 1), Response::PairingArtifact(a) if a.payload == vec![1,2])
+        matches!(process_at(&db, Request::FetchPairingRequest { account: pairing_account(), session_id:[1;16] }, 1), Response::PairingArtifact(a) if a.payload == vec![1,2])
     );
     let stored: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3",
+            "SELECT payload FROM pairing_artifacts_v2 WHERE genesis=?1 AND session=?2 AND kind=?3",
             params![
-                [7u8; 32].to_vec(),
+                canonical_genesis_key(&pairing_account().genesis).unwrap(),
                 [1u8; 16].to_vec(),
                 encode(&PairingArtifactKind::PublicRequest).unwrap()
             ],
@@ -210,7 +372,7 @@ fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
         process_at(
             &db,
             Request::FetchConsumePairingBootstrap {
-                identity: [7; 32],
+                account: pairing_account(),
                 session_id: [1; 16],
                 capability: [3; 32]
             },
@@ -219,13 +381,13 @@ fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
         Response::PairingUnauthorized
     ));
     assert!(
-        matches!(process_at(&db, Request::FetchConsumePairingBootstrap { identity:[7;32], session_id:[1;16], capability:[4;32] }, 1), Response::PairingArtifact(a) if a.payload == bootstrap.payload)
+        matches!(process_at(&db, Request::FetchConsumePairingBootstrap { account: pairing_account(), session_id:[1;16], capability:[4;32] }, 1), Response::PairingArtifact(a) if a.payload == bootstrap.payload)
     );
     assert!(matches!(
         process_at(
             &db,
             Request::FetchConsumePairingBootstrap {
-                identity: [7; 32],
+                account: pairing_account(),
                 session_id: [1; 16],
                 capability: [4; 32]
             },
@@ -237,7 +399,7 @@ fn pairing_artifacts_are_opaque_capability_gated_and_single_use() {
         process_at(
             &db,
             Request::FetchPairingRequest {
-                identity: [7; 32],
+                account: pairing_account(),
                 session_id: [2; 16]
             },
             1
@@ -302,7 +464,7 @@ fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
             process_at(
                 &db,
                 Request::CancelPairing {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [3; 16],
                     capability: [8; 32]
                 },
@@ -314,7 +476,7 @@ fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
             process_at(
                 &db,
                 Request::CancelPairing {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [3; 16],
                     capability: [6; 32]
                 },
@@ -330,7 +492,7 @@ fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
             process_at(
                 &db,
                 Request::FetchConsumePairingBootstrap {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [3; 16],
                     capability: [6; 32]
                 },
@@ -348,7 +510,7 @@ fn pairing_cancellation_expiry_and_restart_preserve_lifecycle_state() {
             process_at(
                 &db,
                 Request::FetchPairingRequest {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [4; 16]
                 },
                 2
@@ -379,7 +541,7 @@ fn pairing_publish_rejects_mismatched_bindings_without_affecting_other_sessions(
     identity_mismatch.identity = [6; 32];
     assert!(matches!(
         process_at(&db, Request::PublishPairingArtifact(identity_mismatch), 1),
-        Response::Ok
+        Response::Error(_)
     ));
     let mut commitment_mismatch = request.clone();
     commitment_mismatch.capability_commitment = pigeon_shared::capability_commitment(&[9; 32]);
@@ -388,18 +550,20 @@ fn pairing_publish_rejects_mismatched_bindings_without_affecting_other_sessions(
         Response::Error(_)
     ));
     assert!(matches!(
-        process_at(&db, Request::FetchPairingRequest { identity:[7;32], session_id:[5;16] }, 1),
+        process_at(&db, Request::FetchPairingRequest { account: pairing_account(), session_id:[5;16] }, 1),
         Response::PairingArtifact(a) if a.payload == request.payload
     ));
+    // A compact-ID substitution cannot create or replace another canonical
+    // genesis session; the original public artifact remains visible.
     assert!(matches!(
-        process_at(&db, Request::FetchPairingRequest { identity:[6;32], session_id:[5;16] }, 1),
-        Response::PairingArtifact(a) if a.payload == vec![3]
+        process_at(&db, Request::FetchPairingRequest { account: pairing_account(), session_id:[5;16] }, 1),
+        Response::PairingArtifact(a) if a.payload == request.payload
     ));
     assert!(matches!(
         process_at(
             &db,
             Request::FetchConsumePairingBootstrap {
-                identity: [7; 32],
+                account: pairing_account(),
                 session_id: [5; 16],
                 capability: [4; 32]
             },
@@ -473,10 +637,10 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
             wrong_commitment,
         ] {
             db.execute(
-                "UPDATE pairing_artifacts SET payload=?1 WHERE identity=?2 AND session=?3 AND kind=?4",
+                "UPDATE pairing_artifacts_v2 SET payload=?1 WHERE genesis=?2 AND session=?3 AND kind=?4",
                 params![
                     encode(&substituted).unwrap(),
-                    [7u8; 32].to_vec(),
+                    canonical_genesis_key(&pairing_account().genesis).unwrap(),
                     [6u8; 16].to_vec(),
                     encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
                 ],
@@ -486,7 +650,7 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
                 process_at(
                     &db,
                     Request::FetchConsumePairingBootstrap {
-                        identity: [7; 32],
+                        account: pairing_account(),
                         session_id: [6; 16],
                         capability: [4; 32]
                     },
@@ -497,9 +661,9 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
         }
         let consumed: i64 = db
             .query_row(
-                "SELECT consumed FROM pairing_artifacts WHERE identity=?1 AND session=?2 AND kind=?3",
+                "SELECT consumed FROM pairing_artifacts_v2 WHERE genesis=?1 AND session=?2 AND kind=?3",
                 params![
-                    [7u8; 32].to_vec(),
+                    canonical_genesis_key(&pairing_account().genesis).unwrap(),
                     [6u8; 16].to_vec(),
                     encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
                 ],
@@ -511,7 +675,7 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
             process_at(
                 &db,
                 Request::FetchPairingRequest {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [7; 16]
                 },
                 1
@@ -519,17 +683,17 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
             Response::PairingArtifact(a) if a.payload == vec![2]
         ));
         db.execute(
-            "UPDATE pairing_artifacts SET payload=?1 WHERE identity=?2 AND session=?3 AND kind=?4",
+            "UPDATE pairing_artifacts_v2 SET payload=?1 WHERE genesis=?2 AND session=?3 AND kind=?4",
             params![
                 encode(&bootstrap).unwrap(),
-                [7u8; 32].to_vec(),
+                canonical_genesis_key(&pairing_account().genesis).unwrap(),
                 [6u8; 16].to_vec(),
                 encode(&PairingArtifactKind::EncryptedBootstrap).unwrap()
             ],
         )
         .unwrap();
         assert!(matches!(
-            process_at(&db, Request::FetchConsumePairingBootstrap { identity:[7;32], session_id:[6;16], capability:[4;32] }, 1),
+            process_at(&db, Request::FetchConsumePairingBootstrap { account: pairing_account(), session_id:[6;16], capability:[4;32] }, 1),
             Response::PairingArtifact(a) if a.payload == bootstrap.payload
         ));
     }
@@ -540,7 +704,7 @@ fn pairing_consume_and_metadata_validation_are_atomic_across_restart() {
             process_at(
                 &db,
                 Request::FetchConsumePairingBootstrap {
-                    identity: [7; 32],
+                    account: pairing_account(),
                     session_id: [6; 16],
                     capability: [4; 32]
                 },
@@ -573,7 +737,8 @@ fn fetch_pairs_sql_id_with_decoded_mls_record() {
         Response::Ok
     ));
     let record = MlsRecord {
-        recipient_identity: identity_id(&card),
+        recipient: account_for(&card),
+        sender: account_for(&card),
         sender_device: [9; 32],
         target_devices: vec![device_key.verifying_key().to_bytes()],
         payload: vec![7, 8, 9],
@@ -585,7 +750,7 @@ fn fetch_pairs_sql_id_with_decoded_mls_record() {
     let Response::MlsMessages(records) = process(
         &database,
         Request::Fetch {
-            identity: identity_id(&card),
+            account: account_for(&card),
             device_id: device_key.verifying_key().to_bytes(),
             known_routing_revision: 0,
         },
@@ -629,7 +794,8 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         Response::Ok
     ));
     let record = MlsRecord {
-        recipient_identity: identity_id(&card),
+        recipient: account_for(&card),
+        sender: account_for(&card),
         sender_device: [7; 32],
         target_devices: vec![a1_record.device_id, a2_record.device_id],
         payload: vec![9],
@@ -641,7 +807,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
     let Response::MlsMessages(a1_events) = process(
         &database,
         Request::Fetch {
-            identity: identity_id(&card),
+            account: account_for(&card),
             device_id: a1_record.device_id,
             known_routing_revision: 0,
         },
@@ -653,6 +819,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Acknowledge {
+                account: account_for(&card),
                 device_id: a1_record.device_id,
                 record_ids: vec![a1_events[0].0],
                 signature: vec![]
@@ -670,7 +837,8 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::SendMls(MlsRecord {
-                recipient_identity: identity_id(&card),
+                recipient: account_for(&card),
+                sender: account_for(&card),
                 sender_device: [8; 32],
                 target_devices: vec![a2_record.device_id],
                 payload: vec![10],
@@ -680,7 +848,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
     ));
     assert_eq!(
         database
-            .query_row("SELECT COUNT(*) FROM mls_events", [], |r| r
+            .query_row("SELECT COUNT(*) FROM mls_events_v2", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
         0
@@ -689,7 +857,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Fetch {
-                identity: identity_id(&card),
+                account: account_for(&card),
                 device_id: a2_record.device_id,
                 known_routing_revision: 0,
             }
@@ -701,7 +869,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
     let Response::Revocations(revocations) = process(
         &database,
         Request::GetRevocations {
-            identity: identity_id(&card),
+            account: account_for(&card),
         },
     ) else {
         panic!("expected revocation sync")
@@ -724,7 +892,7 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         process(
             &database,
             Request::Fetch {
-                identity: identity_id(&card),
+                account: account_for(&card),
                 device_id: a2.verifying_key().to_bytes(),
                 known_routing_revision: 0,
             }
@@ -788,7 +956,8 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     let just_before_dormancy = start + DORMANCY_SECONDS - 1;
     let send = |payload| {
         Request::SendMls(MlsRecord {
-            recipient_identity: identity_id(&alice_card),
+            recipient: account_for(&alice_card),
+            sender: account_for(&alice_card),
             sender_device: b1_record.device_id,
             target_devices: vec![a1_record.device_id, a2_record.device_id],
             payload,
@@ -799,12 +968,13 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         Response::Ok
     ));
     let event_id: i64 = database
-        .query_row("SELECT id FROM mls_events", [], |r| r.get(0))
+        .query_row("SELECT id FROM mls_events_v2", [], |r| r.get(0))
         .unwrap();
     assert!(matches!(
         process_at(
             &database,
             Request::Acknowledge {
+                account: account_for(&alice_card),
                 device_id: a1_record.device_id,
                 record_ids: vec![event_id],
                 signature: vec![]
@@ -815,7 +985,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     ));
     assert_eq!(
         database
-            .query_row("SELECT COUNT(*) FROM mls_events", [], |r| r
+            .query_row("SELECT COUNT(*) FROM mls_events_v2", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
         1
@@ -827,7 +997,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::GetRevocations {
-                identity: identity_id(&alice_card)
+                account: account_for(&alice_card)
             },
             dormant_at,
         ),
@@ -836,8 +1006,11 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT dormant FROM devices WHERE device_id = ?1",
-                params![a2_record.device_id.to_vec()],
+                "SELECT dormant FROM devices_v2 WHERE genesis = ?1 AND device_id = ?2",
+                params![
+                    canonical_genesis_key(&alice_card.genesis).unwrap(),
+                    a2_record.device_id.to_vec()
+                ],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
@@ -845,7 +1018,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     );
     assert_eq!(
         database
-            .query_row("SELECT COUNT(*) FROM mls_events", [], |r| r
+            .query_row("SELECT COUNT(*) FROM mls_events_v2", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
         0
@@ -855,8 +1028,8 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT COUNT(*) FROM event_deliveries WHERE device_id = ?1",
-                params![a2_record.device_id.to_vec()],
+                "SELECT COUNT(*) FROM event_deliveries_v2 WHERE recipient_genesis = ?1 AND device_id = ?2",
+                params![canonical_genesis_key(&alice_card.genesis).unwrap(), a2_record.device_id.to_vec()],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
@@ -879,8 +1052,11 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT dormant FROM devices WHERE device_id = ?1",
-                params![a2_record.device_id.to_vec()],
+                "SELECT dormant FROM devices_v2 WHERE genesis = ?1 AND device_id = ?2",
+                params![
+                    canonical_genesis_key(&alice_card.genesis).unwrap(),
+                    a2_record.device_id.to_vec()
+                ],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
@@ -889,8 +1065,8 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     // Complete the A1-only event, then ensure a future event targets A2.
     let a1_only: i64 = database
         .query_row(
-            "SELECT event_id FROM event_deliveries WHERE device_id = ?1",
-            params![a1_record.device_id.to_vec()],
+            "SELECT event_id FROM event_deliveries_v2 WHERE recipient_genesis = ?1 AND device_id = ?2",
+            params![canonical_genesis_key(&alice_card.genesis).unwrap(), a1_record.device_id.to_vec()],
             |r| r.get(0),
         )
         .unwrap();
@@ -898,6 +1074,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::Acknowledge {
+                account: account_for(&alice_card),
                 device_id: a1_record.device_id,
                 record_ids: vec![a1_only],
                 signature: vec![]
@@ -913,15 +1090,15 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT COUNT(*) FROM event_deliveries WHERE device_id = ?1 AND acknowledged = 0",
-                params![a2_record.device_id.to_vec()],
+                "SELECT COUNT(*) FROM event_deliveries_v2 WHERE recipient_genesis = ?1 AND device_id = ?2 AND acknowledged = 0",
+                params![canonical_genesis_key(&alice_card.genesis).unwrap(), a2_record.device_id.to_vec()],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
         1
     );
     let unresponsive_event: i64 = database
-        .query_row("SELECT MAX(id) FROM mls_events", [], |r| r.get(0))
+        .query_row("SELECT MAX(id) FROM mls_events_v2", [], |r| r.get(0))
         .unwrap();
     let revocation = make_revocation(&alice_root, a2_record.device_id, 9);
     assert!(matches!(
@@ -946,7 +1123,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
         process_at(
             &database,
             Request::GetRevocations {
-                identity: identity_id(&alice_card)
+                account: account_for(&alice_card)
             },
             dormant_at + 1 + RETENTION_SECONDS
         ),
@@ -955,7 +1132,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT COUNT(*) FROM mls_events WHERE id = ?1",
+                "SELECT COUNT(*) FROM mls_events_v2 WHERE id = ?1",
                 params![unresponsive_event],
                 |r| r.get::<_, i64>(0)
             )
@@ -966,7 +1143,7 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     let database = Connection::open(&path).unwrap();
     assert_eq!(
         database
-            .query_row("SELECT COUNT(*) FROM revocations", [], |r| r
+            .query_row("SELECT COUNT(*) FROM revocations_v2", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
         1
@@ -974,8 +1151,11 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT dormant FROM devices WHERE device_id = ?1",
-                params![a1_record.device_id.to_vec()],
+                "SELECT dormant FROM devices_v2 WHERE genesis = ?1 AND device_id = ?2",
+                params![
+                    canonical_genesis_key(&alice_card.genesis).unwrap(),
+                    a1_record.device_id.to_vec()
+                ],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
@@ -984,8 +1164,11 @@ fn dormant_devices_stop_blocking_delivery_and_expiry_is_hard() {
     assert_eq!(
         database
             .query_row(
-                "SELECT last_seen FROM devices WHERE device_id = ?1",
-                params![a1_record.device_id.to_vec()],
+                "SELECT last_seen FROM devices_v2 WHERE genesis = ?1 AND device_id = ?2",
+                params![
+                    canonical_genesis_key(&alice_card.genesis).unwrap(),
+                    a1_record.device_id.to_vec()
+                ],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
@@ -1073,14 +1256,14 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     // Simulate an offline old relay: the destination retains the valid
     // route and can serve it when another reachable path learns it.
     assert!(
-        matches!(process(&new, Request::GetRouting { identity: identity_id(&old_card) }), Response::Routing(Some(route)) if route == moved)
+        matches!(process(&new, Request::GetRouting { account: account_for(&old_card) }), Response::Routing(Some(route)) if route == moved)
     );
     assert!(matches!(
         process(&old, Request::PublishRouting(moved.clone())),
         Response::Ok
     ));
     assert!(
-        matches!(process(&old, Request::Fetch { identity: identity_id(&old_card), device_id: a2_record.device_id, known_routing_revision: 1 }), Response::Moved(route) if route == moved)
+        matches!(process(&old, Request::Fetch { account: account_for(&old_card), device_id: a2_record.device_id, known_routing_revision: 1 }), Response::Moved(route) if route == moved)
     );
     assert_eq!(moved.identity, identity_id(&old_card));
     let mut forged = moved.clone();
@@ -1104,7 +1287,7 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     let Response::Routing(Some(chosen)) = process(
         &old,
         Request::GetRouting {
-            identity: identity_id(&old_card),
+            account: account_for(&old_card),
         },
     ) else {
         panic!("missing route")
@@ -1120,7 +1303,7 @@ fn signed_routing_migration_moves_stale_devices_and_persists() {
     drop(new);
     let new = Connection::open(&path).unwrap();
     assert!(
-        matches!(process(&new, Request::GetRouting { identity: identity_id(&old_card) }), Response::Routing(Some(route)) if route.revision == 2)
+        matches!(process(&new, Request::GetRouting { account: account_for(&old_card) }), Response::Routing(Some(route)) if route.revision == 2)
     );
     let _ = std::fs::remove_file(path);
 }
@@ -1222,7 +1405,8 @@ fn authenticated_opaque_forwarding_queues_retries_and_delivers() {
         Response::Ok
     ));
     let record = MlsRecord {
-        recipient_identity: identity_id(&card),
+        recipient: account_for(&card),
+        sender: account_for(&card),
         sender_device: [7; 32],
         target_devices: vec![bob_device.device_id],
         payload: vec![8, 9],
@@ -1248,7 +1432,7 @@ fn authenticated_opaque_forwarding_queues_retries_and_delivers() {
     let Response::MlsMessages(events) = process(
         &destination,
         Request::Fetch {
-            identity: identity_id(&card),
+            account: account_for(&card),
             device_id: bob_device.device_id,
             known_routing_revision: 1,
         },

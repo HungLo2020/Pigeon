@@ -43,6 +43,11 @@ The server may be authoritative for recent delivery, synchronization, observed a
 
 Server addresses are mutable routing metadata. A user moving to another server remains the same cryptographic identity.
 
+Relay account rows are keyed by the complete canonical `PigeonAccountGenesis`.
+The SHA-256 compact account ID is a non-unique index only; two distinct
+genesis records with the same compact ID coexist without sharing devices,
+routes, delivery state, pairing artifacts, or revocations.
+
 ## Debian relay deployment
 
 The `pigeon-server` Debian package installs the relay binary, `pigeon-setup`,

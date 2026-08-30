@@ -4,11 +4,17 @@ use anyhow::bail;
 use std::fs;
 
 pub(super) fn load(path: &str) -> Result<State> {
-    let state: State = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read identity state {path}"))?,
-    )?;
+    let bytes = fs::read(path).with_context(|| format!("read identity state {path}"))?;
+    let version = serde_json::from_slice::<serde_json::Value>(&bytes)?
+        .get("state_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u8;
+    if version != super::ACCOUNT_STATE_VERSION {
+        bail!("account state format {version} does not preserve canonical-genesis identity keys. Export a fresh encrypted recovery backup with a compatible client and import it; compact-ID-only state is never silently upgraded")
+    }
+    let state: State = serde_json::from_slice(&bytes)?;
     if state.state_version != super::ACCOUNT_STATE_VERSION {
-        bail!("legacy root-only account state is incompatible with account-genesis security. Export a new encrypted recovery backup from a current client, then import it; legacy state is never silently upgraded")
+        bail!("invalid account state version")
     }
     pigeon_shared::verify_card(&state.card)?;
     pigeon_shared::verify_device_set(&state.authorized_devices)?;

@@ -13,13 +13,14 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use pigeon_shared::{
-    account_id, capability_commitment, decode, encode, identity_id, make_authorized_device_set,
-    make_card_from_roster, make_device, make_pairing_approval, make_revocation, make_routing,
-    open_bootstrap, roster_hash, seal_bootstrap, verify_device_set, verify_pairing_approval,
-    verify_pairing_request, verify_roster_transition, AccountTransitionKind, AuthorizedDeviceSet,
-    BootstrapPayload, ContactCard, DeviceRecord, DeviceRevocation, EncryptedBootstrap,
-    PairingApproval, PairingArtifactKind, PairingRelayArtifact, PairingRequest,
-    PigeonAccountGenesis, RelayDescriptor, Request, Response, RoutingRecord,
+    account_id, account_identity, capability_commitment, decode, encode, identity_id,
+    make_authorized_device_set, make_card_from_roster, make_device, make_pairing_approval,
+    make_revocation, make_routing, open_bootstrap, roster_hash, seal_bootstrap, verify_device_set,
+    verify_pairing_approval, verify_pairing_request, verify_roster_transition,
+    AccountTransitionKind, AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord,
+    DeviceRevocation, EncryptedBootstrap, PairingApproval, PairingArtifactKind,
+    PairingRelayArtifact, PairingRequest, PigeonAccountGenesis, RelayDescriptor, Request, Response,
+    RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -90,7 +91,7 @@ struct State {
     #[serde(default)]
     read_at: HashMap<String, i64>,
 }
-const ACCOUNT_STATE_VERSION: u8 = 2;
+const ACCOUNT_STATE_VERSION: u8 = 3;
 const RECOVERY_WRAP_VERSION: u8 = 1;
 #[derive(Clone, Serialize, Deserialize)]
 struct PasswordWrappedRecovery {
@@ -99,7 +100,7 @@ struct PasswordWrappedRecovery {
     nonce: [u8; 24],
     ciphertext: Vec<u8>,
 }
-const PORTABLE_BACKUP_VERSION: u8 = 1;
+const PORTABLE_BACKUP_VERSION: u8 = 2;
 #[derive(Serialize, Deserialize)]
 struct EncryptedPortableBackup {
     version: u8,
@@ -187,7 +188,7 @@ struct LocalMessage {
 #[derive(Clone, Serialize, Deserialize)]
 struct GroupState {
     group_id: Vec<u8>,
-    members: Vec<[u8; 32]>,
+    members: Vec<pigeon_shared::AccountIdentity>,
 }
 #[derive(Serialize, Deserialize)]
 struct PendingPairing {
@@ -372,6 +373,10 @@ enum Command {
     PairRequest {
         #[arg(long)]
         identity: String,
+        /// Base64url canonical PigeonAccountGenesis for the target account.
+        /// A compact identity hash alone is never enough to select an account.
+        #[arg(long)]
+        genesis: String,
         #[arg(long)]
         server: String,
     },
@@ -791,11 +796,14 @@ fn delivery_request(
     }
     let route = state
         .cached_routes
-        .get(&hex::encode(identity))
+        .get(&contact_key(recipient)?)
         .context("cross-server contact has no verified relay-bound route")?
         .clone();
     pigeon_shared::verify_routing(&route)?;
-    if route.identity != identity || route.server == state.card.server {
+    if route.identity != identity
+        || route.genesis != recipient.genesis
+        || route.server == state.card.server
+    {
         bail!("invalid cross-server contact route")
     }
     Ok(Request::QueueForward { record, route })
@@ -805,46 +813,98 @@ fn parse_identity(value: &str) -> Result<[u8; 32]> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("identity must be 32 bytes of hexadecimal"))
 }
+
+fn parse_genesis(value: &str) -> Result<PigeonAccountGenesis> {
+    let genesis: PigeonAccountGenesis = decode(&STANDARD_NO_PAD.decode(value.trim())?)?;
+    pigeon_shared::verify_genesis(&genesis)?;
+    Ok(genesis)
+}
+
+/// Stable local map key for an external account. It is the entire canonical
+/// genesis encoding, not the compact SHA-256 display/index value.
+fn canonical_account_key(genesis: &PigeonAccountGenesis) -> Result<String> {
+    Ok(STANDARD_NO_PAD.encode(pigeon_shared::canonical_genesis_key(genesis)?))
+}
+
+fn contact_key(card: &ContactCard) -> Result<String> {
+    canonical_account_key(&card.genesis)
+}
+
+fn device_mls_key(genesis: &PigeonAccountGenesis, device_id: [u8; 32]) -> Result<String> {
+    Ok(format!(
+        "{}:{}",
+        canonical_account_key(genesis)?,
+        hex::encode(device_id)
+    ))
+}
+
+fn contact_for_selector(state: &State, selector: &str) -> Result<ContactCard> {
+    if let Ok(bytes) = STANDARD_NO_PAD.decode(selector.trim()) {
+        if let Ok(genesis) = decode::<PigeonAccountGenesis>(&bytes) {
+            pigeon_shared::verify_genesis(&genesis)?;
+            return state
+                .contacts
+                .iter()
+                .find(|contact| contact.genesis == genesis)
+                .cloned()
+                .context("unknown canonical contact genesis");
+        }
+    }
+    contact_for(state, parse_identity(selector)?)
+}
 fn contact_for(state: &State, identity: [u8; 32]) -> Result<ContactCard> {
-    state
+    let matches: Vec<_> = state
         .contacts
         .iter()
-        .find(|contact| identity_id(contact) == identity)
+        .filter(|contact| identity_id(contact) == identity)
         .cloned()
-        .context("group member is not a verified contact")
+        .collect();
+    if matches.len() != 1 {
+        bail!("group member compact ID is unknown or collides")
+    }
+    Ok(matches[0].clone())
 }
-fn identities_in_mls_group(state: &State, group: &MlsGroup) -> Vec<[u8; 32]> {
-    let mut identities = vec![identity_id(&state.card)];
+fn identities_in_mls_group(
+    state: &State,
+    group: &MlsGroup,
+) -> Result<Vec<pigeon_shared::AccountIdentity>> {
+    let mut identities = vec![account_identity(state.card.genesis.clone())?];
     for contact in &state.contacts {
         if contact.devices.iter().any(|device| {
             group.members().any(|leaf| {
                 leaf.credential == BasicCredential::new(device.device_id.to_vec()).into()
             })
         }) {
-            identities.push(identity_id(contact));
+            identities.push(account_identity(contact.genesis.clone())?);
         }
     }
-    identities.sort();
-    identities.dedup();
-    identities
+    identities.sort_by_key(|identity| canonical_account_key(&identity.genesis).unwrap_or_default());
+    identities.dedup_by(|left, right| left.genesis == right.genesis);
+    Ok(identities)
 }
 async fn deliver_group_payload(
     state: &State,
     certificate: &str,
-    members: &[[u8; 32]],
+    members: &[pigeon_shared::AccountIdentity],
     payload: Vec<u8>,
 ) -> Result<()> {
     let payload = wrap_mls_payload(state, payload)?;
     for identity in members {
-        if *identity == identity_id(&state.card) {
+        if identity.genesis == state.card.genesis {
             continue;
         }
-        let contact = contact_for(state, *identity)?;
+        let contact = state
+            .contacts
+            .iter()
+            .find(|contact| contact.genesis == identity.genesis)
+            .cloned()
+            .context("group member is not a verified canonical contact")?;
         let request_value = delivery_request(
             state,
             &contact,
             pigeon_shared::MlsRecord {
-                recipient_identity: *identity,
+                recipient: identity.clone(),
+                sender: account_identity(state.card.genesis.clone())?,
                 sender_device: state.device.device_id,
                 target_devices: contact
                     .devices

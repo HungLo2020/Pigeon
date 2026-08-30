@@ -104,6 +104,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     "identity created: {}",
                     hex::encode(identity_id(&state.card))
                 );
+                println!(
+                    "account genesis: {}",
+                    STANDARD_NO_PAD.encode(encode(&state.card.genesis)?)
+                );
                 return Ok(());
             }
             response_ok(
@@ -142,6 +146,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             println!(
                 "identity created: {}",
                 hex::encode(identity_id(&state.card))
+            );
+            println!(
+                "account genesis: {}",
+                STANDARD_NO_PAD.encode(encode(&state.card.genesis)?)
             );
             println!(
                 "export it with: pigeon-client --state {} export --output backup.json",
@@ -317,8 +325,16 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 hex::encode(identity_id(&state.card))
             );
         }
-        Command::PairRequest { identity, server } => {
+        Command::PairRequest {
+            identity,
+            genesis,
+            server,
+        } => {
             let identity = parse_identity(&identity)?;
+            let genesis = parse_genesis(&genesis)?;
+            if identity != account_id(&genesis)? {
+                bail!("pairing target compact ID does not match supplied immutable genesis")
+            }
             let pending_path = pairing_state_path(&args.state);
             if std::path::Path::new(&pending_path).exists() {
                 bail!("a pairing request is already pending for this state path")
@@ -341,6 +357,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let request_value = PairingRequest {
                 version: pigeon_shared::PAIRING_VERSION,
                 identity,
+                genesis,
                 session_id,
                 nonce,
                 expires_at: now + 10 * 60,
@@ -360,6 +377,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let artifact = PairingRelayArtifact {
                 version: pigeon_shared::PAIRING_VERSION,
                 identity,
+                genesis: request_value.genesis.clone(),
                 session_id,
                 nonce,
                 kind: PairingArtifactKind::PublicRequest,
@@ -403,7 +421,9 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 serde_json::from_slice(&STANDARD_NO_PAD.decode(request_text.trim())?)?;
             let now = pairing_now();
             verify_pairing_request(&pairing_request, now)?;
-            if pairing_request.identity != identity_id(&state.card) {
+            if pairing_request.identity != identity_id(&state.card)
+                || pairing_request.genesis != state.card.genesis
+            {
                 bail!("pairing request is for a different identity")
             }
             let root = SigningKey::from_bytes(&state.signing_secret);
@@ -487,6 +507,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let approval_artifact = PairingRelayArtifact {
                 version: pigeon_shared::PAIRING_VERSION,
                 identity: pairing_request.identity,
+                genesis: pairing_request.genesis.clone(),
                 session_id: pairing_request.session_id,
                 nonce: pairing_request.nonce,
                 kind: PairingArtifactKind::Approval,
@@ -505,6 +526,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let bootstrap_artifact = PairingRelayArtifact {
                 version: pigeon_shared::PAIRING_VERSION,
                 identity: pairing_request.identity,
+                genesis: pairing_request.genesis.clone(),
                 session_id: pairing_request.session_id,
                 nonce: pairing_request.nonce,
                 kind: PairingArtifactKind::EncryptedBootstrap,
@@ -535,7 +557,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 &pending.server,
                 &args.certificate,
                 Request::FetchConsumePairingBootstrap {
-                    identity: pending.request.identity,
+                    account: account_identity(pending.request.genesis.clone())?,
                     session_id: pending.request.session_id,
                     capability: pending.bootstrap_capability,
                 },
@@ -545,6 +567,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 bail!("pairing bootstrap is not available: {response:?}")
             };
             if artifact.identity != pending.request.identity
+                || artifact.genesis != pending.request.genesis
                 || artifact.session_id != pending.request.session_id
                 || artifact.nonce != pending.request.nonce
                 || artifact.kind != PairingArtifactKind::EncryptedBootstrap
@@ -561,6 +584,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let bootstrap = open_bootstrap(&pending.request, pending.hpke_secret, &encrypted)?;
             verify_device_set(&bootstrap.roster)?;
             if bootstrap.roster.identity != pending.request.identity
+                || bootstrap.roster.genesis != pending.request.genesis
                 || bootstrap.roster.revision != approval.roster_revision
                 || Sha256::digest(encode(&bootstrap.roster)?).as_slice() != approval.roster_digest
                 || !bootstrap
@@ -572,7 +596,9 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 bail!("bootstrap roster does not authorize this device")
             }
             let control: BootstrapControl = decode(&bootstrap.control_state)?;
-            if identity_id(&control.card) != pending.request.identity {
+            if identity_id(&control.card) != pending.request.identity
+                || control.card.genesis != pending.request.genesis
+            {
                 bail!("bootstrap card identity mismatch")
             }
             let state = State {
@@ -621,7 +647,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 &pending.server,
                 &args.certificate,
                 Request::CancelPairing {
-                    identity: pending.request.identity,
+                    account: account_identity(pending.request.genesis.clone())?,
                     session_id: pending.request.session_id,
                     capability: pending.cancel_capability,
                 },
@@ -675,15 +701,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         }
         Command::SetNickname { identity, nickname } => {
             let mut state = load(&args.state)?;
-            let identity = parse_identity(&identity)?;
-            if !state
-                .contacts
-                .iter()
-                .any(|card| identity_id(card) == identity)
-            {
-                bail!("unknown contact")
-            }
-            let key = hex::encode(identity);
+            let selected = contact_for_selector(&state, &identity)?;
+            let key = contact_key(&selected)?;
             match nickname.filter(|name| !name.trim().is_empty()) {
                 Some(name) => {
                     state.nicknames.insert(key, name.trim().into());
@@ -703,7 +722,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 &card.server,
                 &args.certificate,
                 Request::GetRouting {
-                    identity: contact_identity,
+                    account: account_identity(card.genesis.clone())?,
                 },
             )
             .await
@@ -714,15 +733,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 // so equality is sufficient to cache the route needed for
                 // cross-relay delivery.
                 if route.identity == contact_identity && route.revision >= card.revision {
-                    state
-                        .cached_routes
-                        .insert(hex::encode(contact_identity), route);
+                    state.cached_routes.insert(contact_key(&card)?, route);
                 }
             }
             if !state
                 .contacts
                 .iter()
-                .any(|existing| identity_id(existing) == identity_id(&card))
+                .any(|existing| existing.genesis == card.genesis)
             {
                 state.contacts.push(card);
                 save(&args.state, &state)?;
@@ -731,15 +748,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         }
         Command::Send { to, text } => {
             let state = load(&args.state)?;
-            let recipient = state
-                .contacts
-                .iter()
-                .find(|card| hex::encode(identity_id(card)) == to)
-                .context("unknown contact; add their card first")?
-                .clone();
+            let recipient = contact_for_selector(&state, &to)?;
             let mut state = state;
             let (provider, signer) = mls_runtime(&state)?;
-            let conversation = hex::encode(identity_id(&recipient));
+            let conversation = contact_key(&recipient)?;
             let group_id = if let Some(group_id) = state.mls_conversations.get(&conversation) {
                 GroupId::tls_deserialize_exact(group_id)?
             } else {
@@ -756,7 +768,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     .use_ratchet_tree_extension(true)
                     .build();
                 let credential = CredentialWithKey {
-                    credential: BasicCredential::new(identity_id(&state.card).to_vec()).into(),
+                    credential: BasicCredential::new(pigeon_shared::canonical_genesis_key(
+                        &state.card.genesis,
+                    )?)
+                    .into(),
                     signature_key: signer.to_public_vec().into(),
                 };
                 let mut group = MlsGroup::new(&provider, &signer, &config, credential)?;
@@ -771,7 +786,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                             &state,
                             &recipient,
                             pigeon_shared::MlsRecord {
-                                recipient_identity: identity_id(&recipient),
+                                recipient: account_identity(recipient.genesis.clone())?,
+                                sender: account_identity(state.card.genesis.clone())?,
                                 sender_device: state.device.device_id,
                                 target_devices: recipient
                                     .devices
@@ -791,9 +807,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     .direct_groups
                     .insert(hex::encode(id.as_slice()), conversation.clone());
                 for device in &recipient.devices {
-                    state
-                        .mls_conversations
-                        .insert(hex::encode(device.device_id), id.tls_serialize_detached()?);
+                    state.mls_conversations.insert(
+                        device_mls_key(&recipient.genesis, device.device_id)?,
+                        id.tls_serialize_detached()?,
+                    );
                 }
                 id
             };
@@ -810,7 +827,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                         &state,
                         &recipient,
                         pigeon_shared::MlsRecord {
-                            recipient_identity: identity_id(&recipient),
+                            recipient: account_identity(recipient.genesis.clone())?,
+                            sender: account_identity(state.card.genesis.clone())?,
                             sender_device: state.device.device_id,
                             target_devices: recipient
                                 .devices
@@ -826,7 +844,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             persist_mls(&mut state, &provider)?;
             state.history.push(LocalMessage {
                 conversation: conversation.clone(),
-                sender: hex::encode(identity_id(&state.card)),
+                sender: canonical_account_key(&state.card.genesis)?,
                 text,
                 timestamp: message_time(),
             });
@@ -838,20 +856,31 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             if state.groups.contains_key(&group) {
                 bail!("group already exists")
             }
-            let members: Vec<[u8; 32]> = members
+            let members: Vec<pigeon_shared::AccountIdentity> = members
                 .iter()
-                .map(|member| parse_identity(member))
+                .map(|member| {
+                    let compact = parse_identity(member)?;
+                    let contact = contact_for(&state, compact)?;
+                    account_identity(contact.genesis.clone())
+                })
                 .collect::<Result<_>>()?;
             if members.is_empty()
                 || members
                     .iter()
-                    .any(|member| *member == identity_id(&state.card))
+                    .any(|member| member.genesis == state.card.genesis)
             {
                 bail!("group members must be one or more contacts")
             }
             let contacts: Vec<ContactCard> = members
                 .iter()
-                .map(|member| contact_for(&state, *member))
+                .map(|member| {
+                    state
+                        .contacts
+                        .iter()
+                        .find(|card| card.genesis == member.genesis)
+                        .cloned()
+                        .context("group member is not a verified canonical contact")
+                })
                 .collect::<Result<_>>()?;
             let (provider, signer) = mls_runtime(&state)?;
             let config = MlsGroupCreateConfig::builder()
@@ -875,7 +904,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let (_, welcome, _) = mls_group.add_members(&provider, &signer, &packages)?;
             mls_group.merge_pending_commit(&provider)?;
             let mut identities = members;
-            identities.push(identity_id(&state.card));
+            identities.push(account_identity(state.card.genesis.clone())?);
             let group_id = mls_group.group_id().tls_serialize_detached()?;
             deliver_group_payload(&state, &args.certificate, &identities, welcome.to_bytes()?)
                 .await?;
@@ -901,7 +930,11 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         Command::GroupSend { group, text } => {
             let mut state = load(&args.state)?;
             let group_state = state.groups.get(&group).context("unknown group")?.clone();
-            if !group_state.members.contains(&identity_id(&state.card)) {
+            if !group_state
+                .members
+                .iter()
+                .any(|member| member.genesis == state.card.genesis)
+            {
                 bail!("this identity is not a group member")
             }
             let (provider, signer) = mls_runtime(&state)?;
@@ -917,7 +950,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 // Store the protocol group ID, not a user supplied alias.
                 // Incoming group messages use this same stable identifier.
                 conversation: format!("group:{}", hex::encode(mls_group.group_id().as_slice())),
-                sender: hex::encode(identity_id(&state.card)),
+                sender: canonical_account_key(&state.card.genesis)?,
                 text,
                 timestamp: message_time(),
             });
@@ -927,14 +960,27 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         Command::GroupAdd { group, member } => {
             let mut state = load(&args.state)?;
             let mut group_state = state.groups.get(&group).context("unknown group")?.clone();
-            let member = parse_identity(&member)?;
-            if !group_state.members.contains(&identity_id(&state.card)) {
+            let member = account_identity(contact_for(&state, parse_identity(&member)?)?.genesis)?;
+            if !group_state
+                .members
+                .iter()
+                .any(|entry| entry.genesis == state.card.genesis)
+            {
                 bail!("only a current participant may change membership")
             }
-            if group_state.members.contains(&member) {
+            if group_state
+                .members
+                .iter()
+                .any(|entry| entry.genesis == member.genesis)
+            {
                 bail!("identity is already a member")
             }
-            let contact = contact_for(&state, member)?;
+            let contact = state
+                .contacts
+                .iter()
+                .find(|card| card.genesis == member.genesis)
+                .cloned()
+                .context("unknown canonical group contact")?;
             let (provider, signer) = mls_runtime(&state)?;
             let group_id = GroupId::tls_deserialize_exact(group_state.group_id.clone())?;
             let mut mls_group = MlsGroup::load(provider.storage(), &group_id)?
@@ -947,8 +993,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             }
             let (commit, welcome, _) = mls_group.add_members(&provider, &signer, &packages)?;
             mls_group.merge_pending_commit(&provider)?;
-            deliver_group_payload(&state, &args.certificate, &[member], welcome.to_bytes()?)
-                .await?;
+            deliver_group_payload(
+                &state,
+                &args.certificate,
+                std::slice::from_ref(&member),
+                welcome.to_bytes()?,
+            )
+            .await?;
             deliver_group_payload(
                 &state,
                 &args.certificate,
@@ -970,18 +1021,32 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
         Command::GroupRemove { group, member } => {
             let mut state = load(&args.state)?;
             let mut group_state = state.groups.get(&group).context("unknown group")?.clone();
-            let member = parse_identity(&member)?;
-            if !group_state.members.contains(&identity_id(&state.card)) {
+            let member = account_identity(contact_for(&state, parse_identity(&member)?)?.genesis)?;
+            if !group_state
+                .members
+                .iter()
+                .any(|entry| entry.genesis == state.card.genesis)
+            {
                 bail!("only a current participant may change membership")
             }
-            if member == identity_id(&state.card) || !group_state.members.contains(&member) {
+            if member.genesis == state.card.genesis
+                || !group_state
+                    .members
+                    .iter()
+                    .any(|entry| entry.genesis == member.genesis)
+            {
                 bail!("identity is not a removable group member")
             }
             let (provider, signer) = mls_runtime(&state)?;
             let group_id = GroupId::tls_deserialize_exact(group_state.group_id.clone())?;
             let mut mls_group = MlsGroup::load(provider.storage(), &group_id)?
                 .context("MLS group state missing")?;
-            let contact = contact_for(&state, member)?;
+            let contact = state
+                .contacts
+                .iter()
+                .find(|card| card.genesis == member.genesis)
+                .cloned()
+                .context("unknown canonical group contact")?;
             let device_ids: Vec<Vec<u8>> = contact
                 .devices
                 .iter()
@@ -1001,7 +1066,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             }
             let (commit, _, _) = mls_group.remove_members(&provider, &signer, &leaves)?;
             mls_group.merge_pending_commit(&provider)?;
-            group_state.members = identities_in_mls_group(&state, &mls_group);
+            group_state.members = identities_in_mls_group(&state, &mls_group)?;
             deliver_group_payload(
                 &state,
                 &args.certificate,
@@ -1102,7 +1167,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                             &state,
                             &args.certificate,
                             Request::SendMls(pigeon_shared::MlsRecord {
-                                recipient_identity: identity_id(contact),
+                                recipient: account_identity(contact.genesis.clone())?,
+                                sender: account_identity(state.card.genesis.clone())?,
                                 sender_device: state.device.device_id,
                                 target_devices: contact
                                     .devices
@@ -1126,7 +1192,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                             &state,
                             &args.certificate,
                             Request::SendMls(pigeon_shared::MlsRecord {
-                                recipient_identity: identity_id(&state.card),
+                                recipient: account_identity(state.card.genesis.clone())?,
+                                sender: account_identity(state.card.genesis.clone())?,
                                 sender_device: state.device.device_id,
                                 target_devices: local_targets,
                                 payload: wrap_mls_payload(&state, payload)?,
@@ -1254,21 +1321,32 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let mut state = load(&args.state)?;
             for contact in state.contacts.clone() {
                 let identity = identity_id(&contact);
-                let known_route = state.cached_routes.get(&hex::encode(identity)).cloned();
+                let canonical_key = contact_key(&contact)?;
+                let known_route = state.cached_routes.get(&canonical_key).cloned();
                 let route_response = match known_route {
-                    Some(route) => pinned_request(&route, Request::GetRouting { identity }).await,
+                    Some(route) => {
+                        pinned_request(
+                            &route,
+                            Request::GetRouting {
+                                account: account_identity(contact.genesis.clone())?,
+                            },
+                        )
+                        .await
+                    }
                     None => {
                         request(
                             &contact.server,
                             &args.certificate,
-                            Request::GetRouting { identity },
+                            Request::GetRouting {
+                                account: account_identity(contact.genesis.clone())?,
+                            },
                         )
                         .await
                     }
                 };
                 if let Ok(Response::Routing(Some(route))) = route_response {
                     validate_route_descriptor(&route, &pinned_relay_descriptor(&route).await?)?;
-                    let key = hex::encode(identity);
+                    let key = canonical_key;
                     if route.identity == identity
                         && should_replace_route(state.cached_routes.get(&key), &route)
                     {
@@ -1280,7 +1358,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 &state,
                 &args.certificate,
                 Request::GetRevocations {
-                    identity: identity_id(&state.card),
+                    account: account_identity(state.card.genesis.clone())?,
                 },
             )
             .await?
@@ -1315,7 +1393,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 &state,
                 &args.certificate,
                 Request::Fetch {
-                    identity: identity_id(&state.card),
+                    account: account_identity(state.card.genesis.clone())?,
                     device_id: state.device.device_id,
                     known_routing_revision: state.card.revision,
                 },
@@ -1342,13 +1420,15 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                 bail!("sender contact card does not authorize MLS sender device")
                             }
                             let sender_identity = identity_id(&card);
-                            if sender_identity == identity_id(&state.card) {
+                            if sender_identity == identity_id(&state.card)
+                                && card.genesis == state.card.genesis
+                            {
                                 bail!("received MLS record claims this account as sender")
                             }
                             match state
                                 .contacts
                                 .iter()
-                                .position(|contact| identity_id(contact) == sender_identity)
+                                .position(|contact| contact.genesis == card.genesis)
                             {
                                 Some(index) if card.revision > state.contacts[index].revision => {
                                     let current = &state.contacts[index];
@@ -1382,7 +1462,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                 &route,
                                 &pinned_relay_descriptor(&route).await?,
                             )?;
-                            let route_key = hex::encode(sender_identity);
+                            let route_key = contact_key(&card)?;
                             if should_replace_route(state.cached_routes.get(&route_key), &route) {
                                 state.cached_routes.insert(route_key, route);
                             }
@@ -1398,9 +1478,10 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                 )?
                                 .into_group(&provider)?;
                                 let group_id = group.group_id().tls_serialize_detached()?;
-                                state
-                                    .mls_conversations
-                                    .insert(hex::encode(record.sender_device), group_id.clone());
+                                state.mls_conversations.insert(
+                                    device_mls_key(&record.sender.genesis, record.sender_device)?,
+                                    group_id.clone(),
+                                );
                                 if let Some(contact) = state.contacts.iter().find(|contact| {
                                     contact
                                         .devices
@@ -1412,13 +1493,14 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                     // reuses the established MLS group.
                                     state
                                         .mls_conversations
-                                        .insert(hex::encode(identity_id(contact)), group_id);
+                                        .insert(contact_key(contact)?, group_id);
                                     state.direct_groups.insert(
                                         hex::encode(group.group_id().as_slice()),
-                                        hex::encode(identity_id(contact)),
+                                        contact_key(contact)?,
                                     );
                                 }
-                                let mut members = vec![identity_id(&state.card)];
+                                let mut members =
+                                    vec![account_identity(state.card.genesis.clone())?];
                                 for contact in &state.contacts {
                                     if contact.devices.iter().any(|device| {
                                         group.members().any(|leaf| {
@@ -1427,11 +1509,13 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                                     .into()
                                         })
                                     }) {
-                                        members.push(identity_id(contact));
+                                        members.push(account_identity(contact.genesis.clone())?);
                                     }
                                 }
-                                members.sort();
-                                members.dedup();
+                                members.sort_by_key(|member| {
+                                    canonical_account_key(&member.genesis).unwrap_or_default()
+                                });
+                                members.dedup_by(|left, right| left.genesis == right.genesis);
                                 state
                                     .groups
                                     .entry(hex::encode(group.group_id().as_slice()))
@@ -1442,7 +1526,8 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                             }
                             MlsMessageBodyIn::PrivateMessage(_)
                             | MlsMessageBodyIn::PublicMessage(_) => {
-                                let key = hex::encode(record.sender_device);
+                                let key =
+                                    device_mls_key(&record.sender.genesis, record.sender_device)?;
                                 let protocol = MlsMessageIn::tls_deserialize_exact(mls_payload)?
                                     .try_into_protocol_message()?;
                                 let protocol_group = hex::encode(protocol.group_id().as_slice());
@@ -1473,7 +1558,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                                         device.device_id == record.sender_device
                                                     })
                                                 })
-                                                .map(|contact| hex::encode(identity_id(contact)))
+                                                .and_then(|contact| contact_key(contact).ok())
                                                 .unwrap_or(key.clone())
                                         };
                                         let text = String::from_utf8(message.into_bytes())?;
@@ -1487,7 +1572,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                     }
                                     ProcessedMessageContent::StagedCommitMessage(staged) => {
                                         group.merge_staged_commit(&provider, *staged)?;
-                                        let members = identities_in_mls_group(&state, &group);
+                                        let members = identities_in_mls_group(&state, &group)?;
                                         let group_id = group.group_id().tls_serialize_detached()?;
                                         for group_state in state.groups.values_mut() {
                                             if group_state.group_id == group_id {
@@ -1512,6 +1597,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                 &state,
                                 &args.certificate,
                                 Request::Acknowledge {
+                                    account: account_identity(state.card.genesis.clone())?,
                                     device_id: state.device.device_id,
                                     record_ids,
                                     signature: vec![],
@@ -1525,6 +1611,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 Response::Moved(route) => {
                     validate_route_descriptor(&route, &pinned_relay_descriptor(&route).await?)?;
                     if route.identity != identity_id(&state.card)
+                        || route.genesis != state.card.genesis
                         || route.revision
                             <= state
                                 .routing
@@ -1609,7 +1696,8 @@ async fn add_paired_device_to_mls_groups(
                 state,
                 certificate,
                 Request::SendMls(pigeon_shared::MlsRecord {
-                    recipient_identity: identity_id(&state.card),
+                    recipient: account_identity(state.card.genesis.clone())?,
+                    sender: account_identity(state.card.genesis.clone())?,
                     sender_device: state.device.device_id,
                     target_devices: vec![device.device_id],
                     payload: wrap_mls_payload(state, welcome.to_bytes()?)?,
@@ -1617,7 +1705,7 @@ async fn add_paired_device_to_mls_groups(
             )
             .await?,
         )?;
-        let members = identities_in_mls_group(state, &group);
+        let members = identities_in_mls_group(state, &group)?;
         deliver_group_payload(state, certificate, &members, commit.to_bytes()?).await?;
     }
     persist_mls(state, &provider)

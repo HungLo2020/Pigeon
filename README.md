@@ -18,7 +18,9 @@ Pigeon is a sovereign, end-to-end encrypted communication platform designed so t
 
 Pigeon separates **identity**, **routing**, **recent synchronization**, and **long-term history**.
 
-- A user's identity is a stable cryptographic identity and is not tied to a server.
+- A user's identity is the complete canonical immutable account genesis and is
+  not tied to a server. Its SHA-256 compact ID is useful for display/indexing,
+  but never proves identity equality or global uniqueness.
 - Users control a portable, password-encrypted backup containing root and
   independent recovery authority. Import always creates a fresh device through
   a recovery-authorized roster transition; it does not recreate history or MLS
@@ -34,6 +36,12 @@ Pigeon separates **identity**, **routing**, **recent synchronization**, and **lo
 - Devices retain long-term history according to local user-configurable retention policies.
 - Server changes are signed identity events and should automatically propagate to the user's other devices and contacts.
 - There is no global authoritative Pigeon identity directory.
+
+Canonical genesis, rather than a compact ID, is the equality and authorization
+anchor at protocol and storage boundaries. Two byte-distinct valid genesis
+records remain separate contacts/accounts even if a controlled test fixture or
+an improbable hash collision gives them the same short ID. The UI may surface
+that identifier collision, but it must never merge state.
 
 ## Device States
 

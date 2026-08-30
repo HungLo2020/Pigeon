@@ -12,7 +12,7 @@ rusqlite.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
-pigeon-shared = { path = "../shared" }
+pigeon-shared = { path = "../shared", features = ["test-identity-collision"] }
 ed25519-dalek.workspace = true
 rand_core.workspace = true
 serde_json.workspace = true

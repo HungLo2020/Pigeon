@@ -3,6 +3,9 @@ name = "pigeon-shared"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-identity-collision = []
+
 [dependencies]
 anyhow.workspace = true
 bincode.workspace = true

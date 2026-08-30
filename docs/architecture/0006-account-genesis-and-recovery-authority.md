@@ -9,10 +9,11 @@ Accepted.
 An account is anchored by a canonical, versioned `PigeonAccountGenesis`:
 root public key, initial device public key/record, an independent recovery
 public key, a CSPRNG genesis nonce, protocol version, and the initial public
-display name.  The stable account ID is SHA-256 over a domain-separated
-canonical encoding of that genesis. It is never the root public key itself.
+display name. `identity_id = SHA-256` over a domain-separated canonical
+encoding of that genesis is only a compact lookup/display/index value. It is
+never identity evidence, a global uniqueness claim, or the root public key.
 Two different valid genesis records remain different accounts even if they
-reuse a root key.
+reuse a root key or (however improbably) have the same compact SHA-256 ID.
 
 The root key signs public profile, routing, device records, and account-state
 records, but root possession alone is insufficient to enroll a device into an
@@ -46,15 +47,18 @@ state, MLS epoch secrets, or long-term history. Import always creates a fresh
 device and fresh MLS material and authorizes it through recovery.
 
 Mutable display names remain root-signed profile metadata. Local nicknames are
-account-local presentation data and never leave the device. Full account IDs
-are used for all protocol comparisons; shortened IDs are presentation only.
+account-local presentation data and never leave the device. The complete
+canonical genesis is used for all protocol comparisons; compact/shortened IDs
+are presentation or non-unique index values only.
 
 ## Migration and invariants
 
 The prior root-key-as-ID state format is incompatible. Clients reject it with
 a clear migration error; they must not infer a genesis or silently preserve a
-root-only enrollment path. New relays reject conflicting genesis data for an
-existing account ID and validate roster transitions against the prior roster.
+root-only enrollment path. Relays key account state by canonical genesis bytes
+and retain the compact ID only as a non-unique index, so they accept distinct
+genesis records sharing a compact ID and validate transitions against the
+prior roster selected by exact genesis.
 
 1. Root-key possession alone cannot create a normal enrollment transition.
 2. A device approval cannot be replayed against another account, genesis,
@@ -63,4 +67,11 @@ existing account ID and validate roster transitions against the prior roster.
    separately exported history/epoch transfer.
 4. Relay storage and TLS/routing remain operational metadata, never account
    authority.
-
+5. Routing, pairing, roster/revocation, forwarding, delivery, fetch, ACK, and
+   key-package operations carry or verify enough genesis-bound evidence to
+   select an exact account. A compact-ID match alone cannot authorize a read,
+   mutation, or transition.
+6. Disconnected relays may independently know distinct accounts with the same
+   compact ID. When their worlds communicate, both accounts coexist; a client
+   may record an identifier-collision warning but must never merge contacts or
+   reinterpret either account.

@@ -18,4 +18,9 @@ Expected responsibilities include:
 
 The shared protocol must distinguish stable cryptographic identity from mutable server routing information, distinguish device authorization from delivery status, and support the 14-day-or-all-active-devices-delivered server retention rule plus the 90-day dormancy rule.
 
+`PigeonAccountGenesis` is the authoritative identity anchor. Its SHA-256
+compact ID is never an equality or authorization primitive by itself: account
+selection messages must bind canonical genesis, and compact-ID collisions must
+remain isolated.
+
 This crate should remain platform-neutral.

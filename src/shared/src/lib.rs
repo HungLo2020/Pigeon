@@ -6,6 +6,11 @@ use hpke::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "test-identity-collision")]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 use x25519_dalek::{PublicKey, StaticSecret};
 use x509_parser::prelude::parse_x509_certificate;
 
@@ -23,6 +28,15 @@ pub struct PigeonAccountGenesis {
     pub recovery_public_key: [u8; 32],
     pub nonce: [u8; 32],
     pub initial_display_name: String,
+}
+
+/// The complete immutable account anchor carried whenever an account must be
+/// selected or authorized. `compact_id` is deliberately only an index and UI
+/// convenience: equality is defined by `genesis`, never by the hash alone.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AccountIdentity {
+    pub compact_id: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
 }
 
 pub fn genesis_bytes(genesis: &PigeonAccountGenesis) -> Result<Vec<u8>> {
@@ -50,7 +64,58 @@ pub fn account_id(genesis: &PigeonAccountGenesis) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
     hash.update(b"pigeon-account-genesis-v1\\0");
     hash.update(genesis_bytes(genesis)?);
-    Ok(hash.finalize().into())
+    let derived: [u8; 32] = hash.finalize().into();
+    #[cfg(feature = "test-identity-collision")]
+    if let Some(forced) = identity_collision_overrides()
+        .lock()
+        .expect("identity collision test seam lock")
+        .get(&genesis_bytes(genesis)?)
+    {
+        return Ok(*forced);
+    }
+    Ok(derived)
+}
+
+/// Test-only seam used to prove that every storage and protocol boundary uses
+/// canonical genesis in addition to the compact hash. It is compiled only by
+/// the relay test target and has no production caller or runtime input.
+#[cfg(feature = "test-identity-collision")]
+pub fn force_compact_id_for_test(
+    genesis: &PigeonAccountGenesis,
+    compact_id: [u8; 32],
+) -> Result<()> {
+    identity_collision_overrides()
+        .lock()
+        .expect("identity collision test seam lock")
+        .insert(genesis_bytes(genesis)?, compact_id);
+    Ok(())
+}
+
+#[cfg(feature = "test-identity-collision")]
+fn identity_collision_overrides() -> &'static Mutex<HashMap<Vec<u8>, [u8; 32]>> {
+    static OVERRIDES: OnceLock<Mutex<HashMap<Vec<u8>, [u8; 32]>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn account_identity(genesis: PigeonAccountGenesis) -> Result<AccountIdentity> {
+    Ok(AccountIdentity {
+        compact_id: account_id(&genesis)?,
+        genesis,
+    })
+}
+
+/// Canonical persistent key for an account. This is intentionally the full
+/// canonical genesis encoding rather than its SHA-256 compact identifier.
+pub fn canonical_genesis_key(genesis: &PigeonAccountGenesis) -> Result<Vec<u8>> {
+    genesis_bytes(genesis)
+}
+
+pub fn verify_account_identity(identity: &AccountIdentity) -> Result<()> {
+    verify_genesis(&identity.genesis)?;
+    if identity.compact_id != account_id(&identity.genesis)? {
+        anyhow::bail!("account compact identifier does not match immutable genesis")
+    }
+    Ok(())
 }
 
 pub fn verify_genesis(genesis: &PigeonAccountGenesis) -> Result<()> {
@@ -175,7 +240,10 @@ pub struct ContactCard {
 /// parses MLS payloads or holds MLS private state.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct MlsRecord {
-    pub recipient_identity: [u8; 32],
+    pub recipient: AccountIdentity,
+    /// Sender account anchor prevents a device-key collision from affecting a
+    /// different account's lifecycle state. Relays still see no MLS plaintext.
+    pub sender: AccountIdentity,
     pub sender_device: [u8; 32],
     pub target_devices: Vec<[u8; 32]>,
     pub payload: Vec<u8>,
@@ -199,6 +267,7 @@ pub enum PairingArtifactKind {
 pub struct PairingRelayArtifact {
     pub version: u8,
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub session_id: [u8; 16],
     pub nonce: [u8; 16],
     pub kind: PairingArtifactKind,
@@ -210,7 +279,8 @@ pub fn capability_commitment(capability: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(capability).into()
 }
 pub fn verify_pairing_artifact(a: &PairingRelayArtifact, now: i64) -> Result<()> {
-    if a.version != PAIRING_VERSION || a.expires_at <= now {
+    if a.version != PAIRING_VERSION || a.expires_at <= now || a.identity != account_id(&a.genesis)?
+    {
         anyhow::bail!("invalid or expired pairing artifact")
     }
     Ok(())
@@ -219,6 +289,7 @@ pub fn verify_pairing_artifact(a: &PairingRelayArtifact, now: i64) -> Result<()>
 pub struct PairingRequest {
     pub version: u8,
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub session_id: [u8; 16],
     pub nonce: [u8; 16],
     pub expires_at: i64,
@@ -247,6 +318,7 @@ pub struct PairingApproval {
 pub struct PairingCancel {
     pub version: u8,
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub session_id: [u8; 16],
     pub nonce: [u8; 16],
     pub expires_at: i64,
@@ -286,7 +358,11 @@ fn approval_bytes(a: &PairingApproval) -> Vec<u8> {
     ))
 }
 pub fn verify_pairing_request(r: &PairingRequest, now: i64) -> Result<()> {
-    if r.version != PAIRING_VERSION || r.expires_at <= now || r.device.identity != r.identity {
+    if r.version != PAIRING_VERSION
+        || r.expires_at <= now
+        || r.device.identity != r.identity
+        || r.identity != account_id(&r.genesis)?
+    {
         anyhow::bail!("invalid or expired pairing request")
     }
     // A joining device does not yet possess the root key, so this is public
@@ -317,6 +393,7 @@ pub fn make_pairing_approval(
     bootstrap_hash: [u8; 32],
 ) -> Result<PairingApproval> {
     if roster.identity != r.identity
+        || roster.genesis != r.genesis
         || !roster
             .devices
             .iter()
@@ -352,6 +429,7 @@ pub fn verify_pairing_approval(r: &PairingRequest, a: &PairingApproval, now: i64
     if a.version != PAIRING_VERSION
         || a.expires_at <= now
         || a.identity != r.identity
+        || a.genesis != r.genesis
         || a.session_id != r.session_id
         || a.nonce != r.nonce
         || a.device.device_id != r.device.device_id
@@ -415,11 +493,11 @@ pub enum Request {
     },
     RevokeDevice(DeviceRevocation),
     GetRevocations {
-        identity: [u8; 32],
+        account: AccountIdentity,
     },
     PublishRouting(RoutingRecord),
     GetRouting {
-        identity: [u8; 32],
+        account: AccountIdentity,
     },
     GetRelayDescriptor,
     QueueForward {
@@ -428,35 +506,36 @@ pub enum Request {
     },
     ForwardMls(RelayForward),
     PublishKeyPackage {
-        identity: [u8; 32],
+        account: AccountIdentity,
         key_package: Vec<u8>,
     },
     GetKeyPackage {
-        identity: [u8; 32],
+        account: AccountIdentity,
     },
     SendMls(MlsRecord),
     Fetch {
-        identity: [u8; 32],
+        account: AccountIdentity,
         device_id: [u8; 32],
         known_routing_revision: u64,
     },
     Acknowledge {
+        account: AccountIdentity,
         device_id: [u8; 32],
         record_ids: Vec<i64>,
         signature: Vec<u8>,
     },
     PublishPairingArtifact(PairingRelayArtifact),
     FetchPairingRequest {
-        identity: [u8; 32],
+        account: AccountIdentity,
         session_id: [u8; 16],
     },
     FetchConsumePairingBootstrap {
-        identity: [u8; 32],
+        account: AccountIdentity,
         session_id: [u8; 16],
         capability: [u8; 32],
     },
     CancelPairing {
-        identity: [u8; 32],
+        account: AccountIdentity,
         session_id: [u8; 16],
         capability: [u8; 32],
     },
@@ -993,6 +1072,21 @@ mod tests {
     }
 
     #[test]
+    fn canonical_genesis_defines_identity_equivalence_not_the_compact_display_id() {
+        let root = SigningKey::generate(&mut rand_core::OsRng);
+        let recovery = SigningKey::generate(&mut rand_core::OsRng);
+        let device = SigningKey::generate(&mut rand_core::OsRng);
+        let genesis = test_genesis(&root, &recovery, &device);
+        let first = account_identity(genesis.clone()).unwrap();
+        let second = account_identity(genesis).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            canonical_genesis_key(&first.genesis).unwrap(),
+            canonical_genesis_key(&second.genesis).unwrap()
+        );
+    }
+
+    #[test]
     fn root_authorizes_two_distinct_devices_across_restart_serialization() {
         let root = SigningKey::generate(&mut rand_core::OsRng);
         let recovery = SigningKey::generate(&mut rand_core::OsRng);
@@ -1175,6 +1269,7 @@ mod tests {
         let request = PairingRequest {
             version: PAIRING_VERSION,
             identity,
+            genesis: genesis.clone(),
             session_id: [1; 16],
             nonce: [2; 16],
             expires_at: 100,

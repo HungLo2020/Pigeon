@@ -31,8 +31,10 @@
 
 ## Identity and Routing
 
-- A user's stable identity is the hash of an immutable, versioned account
-  genesis record, not a root public key alone.
+- A user's authoritative stable identity is the complete canonical immutable,
+  versioned account genesis record. Its SHA-256 `identity_id` is only a compact
+  non-unique lookup/display/index value, never sufficient evidence that two
+  accounts are the same and not a root public key.
 - Every authorized device is an equal peer with a distinct device credential.
   Root signatures remain necessary but root-key possession alone cannot enroll
   an endpoint into an established account: normal enrollment also requires an
@@ -46,6 +48,10 @@
 - Routing records are signed by the identity and monotonically versioned.
 - Clients reject unsigned, invalid, or older routing revisions.
 - No global authoritative Pigeon directory is required.
+- Every authorization, transition, routing/delivery lookup, pairing session,
+  contact map, MLS association, and relay row must bind/select canonical
+  genesis. Relays may host multiple distinct accounts with the same compact
+  ID; disconnected relays need no global collision awareness.
 
 ## Device Lifecycle
 

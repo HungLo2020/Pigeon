@@ -79,6 +79,14 @@ fn id(output: &str) -> String {
         .to_owned()
 }
 
+fn genesis(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("account genesis: "))
+        .expect("account genesis output")
+        .to_owned()
+}
+
 fn client_args(state: &Path, certificate: &Path, command: Vec<String>) -> Vec<String> {
     let mut arguments = vec![
         "--state".into(),
@@ -210,7 +218,7 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
     wait_for_relay(&mut relay, address, &certificate);
     let existing = directory.join("existing.json");
     let joining = directory.join("joining.json");
-    let root_id = id(&run(
+    let created = run(
         &client_bin,
         &client_args(
             &existing,
@@ -225,7 +233,9 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
                 "correct horse battery staple".into(),
             ],
         ),
-    ));
+    );
+    let root_id = id(&created);
+    let root_genesis = genesis(&created);
     let pairing_request = run(
         &client_bin,
         &client_args(
@@ -235,6 +245,8 @@ fn pairing_creates_a_distinct_device_with_the_same_root_identity() {
                 "pair-request".into(),
                 "--identity".into(),
                 root_id.clone(),
+                "--genesis".into(),
+                root_genesis,
                 "--server".into(),
                 address.into(),
             ],

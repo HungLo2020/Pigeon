@@ -3848,6 +3848,8 @@ name = "pigeon-tauri"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bincode",
+ "pigeon-shared",
  "serde",
  "serde_json",
  "tauri",

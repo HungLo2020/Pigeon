@@ -24,7 +24,7 @@ pub(crate) fn bind_relay_tls_spki(connection: &Connection, spki: [u8; 32]) -> Re
             // A certificate may change only after a root-signed v2 route that
             // names this relay and the new pin is already persisted.
             let routes = connection
-                .prepare("SELECT route FROM routes")?
+                .prepare("SELECT route FROM routes_v2")?
                 .query_map([], |r| r.get::<_, Vec<u8>>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let identity = relay_identity(connection)?;

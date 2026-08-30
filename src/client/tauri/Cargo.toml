@@ -8,7 +8,9 @@ tauri-build = { version = "2.4", features = [] }
 
 [dependencies]
 base64.workspace = true
+bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+pigeon-shared = { path = "../../shared" }
 tauri = { version = "2.9", features = [] }
 tauri-plugin-dialog = "2"
