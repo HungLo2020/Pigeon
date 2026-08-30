@@ -9,7 +9,66 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use x509_parser::prelude::parse_x509_certificate;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+/// The immutable, canonical account anchor.  Its hash is Pigeon's stable
+/// identity identifier; the root public key deliberately is not.
+pub const ACCOUNT_GENESIS_VERSION: u8 = 1;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PigeonAccountGenesis {
+    pub version: u8,
+    pub root_public_key: [u8; 32],
+    pub initial_device_key: [u8; 32],
+    /// Ed25519 verification key for independent recovery authority.  The
+    /// corresponding secret is random and password-wrapped locally.
+    pub recovery_public_key: [u8; 32],
+    pub nonce: [u8; 32],
+    pub initial_display_name: String,
+}
+
+pub fn genesis_bytes(genesis: &PigeonAccountGenesis) -> Result<Vec<u8>> {
+    if genesis.version != ACCOUNT_GENESIS_VERSION
+        || genesis.root_public_key == [0; 32]
+        || genesis.initial_device_key == [0; 32]
+        || genesis.recovery_public_key == [0; 32]
+        || genesis.nonce == [0; 32]
+        || genesis.initial_display_name.trim().is_empty()
+        || genesis.initial_display_name.chars().count() > 64
+    {
+        anyhow::bail!("unsupported or malformed account genesis")
+    }
+    Ok(bincode::serialize(&(
+        genesis.version,
+        genesis.root_public_key,
+        genesis.initial_device_key,
+        genesis.recovery_public_key,
+        genesis.nonce,
+        &genesis.initial_display_name,
+    ))?)
+}
+
+pub fn account_id(genesis: &PigeonAccountGenesis) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"pigeon-account-genesis-v1\\0");
+    hash.update(genesis_bytes(genesis)?);
+    Ok(hash.finalize().into())
+}
+
+pub fn verify_genesis(genesis: &PigeonAccountGenesis) -> Result<()> {
+    let _ = genesis_bytes(genesis)?;
+    VerifyingKey::from_bytes(&genesis.root_public_key)?;
+    VerifyingKey::from_bytes(&genesis.recovery_public_key)?;
+    VerifyingKey::from_bytes(&genesis.initial_device_key)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum AccountTransitionKind {
+    Genesis,
+    DeviceAndRecovery,
+    Recovery,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct DeviceRecord {
     pub identity: [u8; 32],
     pub device_id: [u8; 32],
@@ -20,11 +79,19 @@ pub struct DeviceRecord {
 }
 /// Public, root-authoritative device roster. This is distinct from a device's
 /// local private credential and from the relay's observed delivery state.
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct AuthorizedDeviceSet {
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub revision: u64,
     pub devices: Vec<DeviceRecord>,
+    /// Hash of the prior canonical roster; zero only at genesis.
+    pub previous_roster_hash: [u8; 32],
+    pub transition: AccountTransitionKind,
+    pub approving_device: Option<[u8; 32]>,
+    pub root_signature: Vec<u8>,
+    pub recovery_signature: Vec<u8>,
+    pub approving_device_signature: Vec<u8>,
 }
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum DeviceState {
@@ -35,6 +102,7 @@ pub enum DeviceState {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct DeviceRevocation {
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub device_id: [u8; 32],
     pub revision: u64,
     pub signature: Vec<u8>,
@@ -45,6 +113,7 @@ pub struct DeviceRevocation {
 pub struct RoutingRecord {
     pub version: u8,
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub server: String,
     pub revision: u64,
     pub parent_revision: u64,
@@ -92,10 +161,12 @@ pub struct ContactCard {
     #[serde(default)]
     pub profile_version: u8,
     pub signing_key: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub encryption_key: [u8; 32],
     pub server: String,
     pub revision: u64,
     pub devices: Vec<DeviceRecord>,
+    pub authorized_devices: AuthorizedDeviceSet,
     #[serde(default)]
     pub display_name: String,
     pub signature: Vec<u8>,
@@ -161,6 +232,7 @@ pub struct PairingRequest {
 pub struct PairingApproval {
     pub version: u8,
     pub identity: [u8; 32],
+    pub genesis: PigeonAccountGenesis,
     pub session_id: [u8; 16],
     pub nonce: [u8; 16],
     pub device: DeviceRecord,
@@ -202,6 +274,7 @@ fn approval_bytes(a: &PairingApproval) -> Vec<u8> {
     pairing_bytes(&(
         a.version,
         a.identity,
+        &a.genesis,
         a.session_id,
         a.nonce,
         &a.device,
@@ -226,11 +299,12 @@ pub fn verify_pairing_request(r: &PairingRequest, now: i64) -> Result<()> {
 }
 pub fn authorize_pairing_device(
     root: &SigningKey,
+    genesis: &PigeonAccountGenesis,
     material: &DeviceRecord,
     authorization_revision: u64,
 ) -> DeviceRecord {
     let mut device = material.clone();
-    device.identity = root.verifying_key().to_bytes();
+    device.identity = account_id(genesis).expect("validated genesis");
     device.device_id = device.device_key;
     device.authorization_revision = authorization_revision;
     device.signature = root.sign(&device_bytes(&device)).to_bytes().to_vec();
@@ -259,6 +333,7 @@ pub fn make_pairing_approval(
     let mut a = PairingApproval {
         version: PAIRING_VERSION,
         identity: r.identity,
+        genesis: roster.genesis.clone(),
         session_id: r.session_id,
         nonce: r.nonce,
         device: device.clone(),
@@ -286,8 +361,12 @@ pub fn verify_pairing_approval(r: &PairingRequest, a: &PairingApproval, now: i64
     {
         anyhow::bail!("pairing approval does not bind request")
     }
-    verify_device(&a.device)?;
-    VerifyingKey::from_bytes(&a.identity)?
+    verify_genesis(&a.genesis)?;
+    if a.identity != account_id(&a.genesis)? {
+        anyhow::bail!("pairing approval account genesis mismatch")
+    }
+    verify_device_with_genesis(&a.device, &a.genesis)?;
+    VerifyingKey::from_bytes(&a.genesis.root_public_key)?
         .verify(&approval_bytes(a), &signature(&a.signature)?)
         .map_err(Into::into)
 }
@@ -403,19 +482,23 @@ pub enum Response {
 #[derive(Serialize, Deserialize)]
 struct UnsignedCard {
     signing_key: [u8; 32],
+    genesis: PigeonAccountGenesis,
     encryption_key: [u8; 32],
     server: String,
     revision: u64,
     devices: Vec<DeviceRecord>,
+    authorized_devices: AuthorizedDeviceSet,
 }
 #[derive(Serialize)]
 struct UnsignedProfileCard {
     profile_version: u8,
     signing_key: [u8; 32],
+    genesis: PigeonAccountGenesis,
     encryption_key: [u8; 32],
     server: String,
     revision: u64,
     devices: Vec<DeviceRecord>,
+    authorized_devices: AuthorizedDeviceSet,
     display_name: String,
 }
 fn card_bytes(card: &ContactCard) -> Vec<u8> {
@@ -423,20 +506,24 @@ fn card_bytes(card: &ContactCard) -> Vec<u8> {
         return bincode::serialize(&UnsignedProfileCard {
             profile_version: card.profile_version,
             signing_key: card.signing_key,
+            genesis: card.genesis.clone(),
             encryption_key: card.encryption_key,
             server: card.server.clone(),
             revision: card.revision,
             devices: card.devices.clone(),
+            authorized_devices: card.authorized_devices.clone(),
             display_name: card.display_name.clone(),
         })
         .expect("serializable profile card");
     }
     bincode::serialize(&UnsignedCard {
         signing_key: card.signing_key,
+        genesis: card.genesis.clone(),
         encryption_key: card.encryption_key,
         server: card.server.clone(),
         revision: card.revision,
         devices: card.devices.clone(),
+        authorized_devices: card.authorized_devices.clone(),
     })
     .expect("serializable card")
 }
@@ -444,7 +531,7 @@ fn signature(bytes: &[u8]) -> Result<Signature> {
     Ok(Signature::from_bytes(bytes.try_into()?))
 }
 pub fn identity_id(card: &ContactCard) -> [u8; 32] {
-    card.signing_key
+    account_id(&card.genesis).expect("verified account genesis")
 }
 fn device_bytes(device: &DeviceRecord) -> Vec<u8> {
     bincode::serialize(&(
@@ -456,11 +543,33 @@ fn device_bytes(device: &DeviceRecord) -> Vec<u8> {
     ))
     .expect("serializable device")
 }
-pub fn make_device(root: &SigningKey, device: &SigningKey, package: Vec<u8>) -> DeviceRecord {
+fn roster_bytes(roster: &AuthorizedDeviceSet) -> Vec<u8> {
+    bincode::serialize(&(
+        roster.identity,
+        &roster.genesis,
+        roster.revision,
+        &roster.devices,
+        roster.previous_roster_hash,
+        roster.transition,
+        roster.approving_device,
+    ))
+    .expect("serializable authorized-device roster")
+}
+
+pub fn roster_hash(roster: &AuthorizedDeviceSet) -> [u8; 32] {
+    Sha256::digest(roster_bytes(roster)).into()
+}
+
+pub fn make_device(
+    root: &SigningKey,
+    identity: [u8; 32],
+    device: &SigningKey,
+    package: Vec<u8>,
+) -> DeviceRecord {
     let mut id = [0; 32];
     id.copy_from_slice(&device.verifying_key().to_bytes());
     let mut record = DeviceRecord {
-        identity: root.verifying_key().to_bytes(),
+        identity,
         device_id: id,
         device_key: device.verifying_key().to_bytes(),
         mls_key_package: package,
@@ -470,26 +579,137 @@ pub fn make_device(root: &SigningKey, device: &SigningKey, package: Vec<u8>) -> 
     record.signature = root.sign(&device_bytes(&record)).to_bytes().to_vec();
     record
 }
-pub fn verify_device(record: &DeviceRecord) -> Result<()> {
+pub fn verify_device_with_genesis(
+    record: &DeviceRecord,
+    genesis: &PigeonAccountGenesis,
+) -> Result<()> {
     if record.device_id != record.device_key {
         anyhow::bail!("device id must be its stable device public key")
     }
-    VerifyingKey::from_bytes(&record.identity)?
+    if record.identity != account_id(genesis)? {
+        anyhow::bail!("device record identity does not match account genesis")
+    }
+    VerifyingKey::from_bytes(&genesis.root_public_key)?
         .verify(&device_bytes(record), &signature(&record.signature)?)
         .map_err(Into::into)
 }
+#[allow(clippy::too_many_arguments)]
+pub fn make_authorized_device_set(
+    genesis: PigeonAccountGenesis,
+    root: &SigningKey,
+    recovery: &SigningKey,
+    devices: Vec<DeviceRecord>,
+    revision: u64,
+    previous: Option<&AuthorizedDeviceSet>,
+    approving_device: Option<(&SigningKey, [u8; 32])>,
+    transition: AccountTransitionKind,
+) -> Result<AuthorizedDeviceSet> {
+    verify_genesis(&genesis)?;
+    let identity = account_id(&genesis)?;
+    let previous_roster_hash = previous.map(roster_hash).unwrap_or([0; 32]);
+    let mut roster = AuthorizedDeviceSet {
+        identity,
+        genesis,
+        revision,
+        devices,
+        previous_roster_hash,
+        transition,
+        approving_device: approving_device.map(|(_, id)| id),
+        root_signature: vec![0; 64],
+        recovery_signature: vec![0; 64],
+        approving_device_signature: vec![],
+    };
+    let bytes = roster_bytes(&roster);
+    roster.root_signature = root.sign(&bytes).to_bytes().to_vec();
+    roster.recovery_signature = recovery.sign(&bytes).to_bytes().to_vec();
+    if let Some((signer, _)) = approving_device {
+        roster.approving_device_signature = signer.sign(&bytes).to_bytes().to_vec();
+    }
+    verify_device_set(&roster)?;
+    if let Some(previous) = previous {
+        verify_roster_transition(previous, &roster)?;
+    }
+    Ok(roster)
+}
 pub fn verify_device_set(set: &AuthorizedDeviceSet) -> Result<()> {
+    verify_genesis(&set.genesis)?;
+    if set.identity != account_id(&set.genesis)? || set.revision == 0 {
+        anyhow::bail!("authorized-device roster has an invalid account identity or revision")
+    }
+    let bytes = roster_bytes(set);
+    VerifyingKey::from_bytes(&set.genesis.root_public_key)?
+        .verify(&bytes, &signature(&set.root_signature)?)?;
+    VerifyingKey::from_bytes(&set.genesis.recovery_public_key)?
+        .verify(&bytes, &signature(&set.recovery_signature)?)?;
+    match set.transition {
+        AccountTransitionKind::Genesis => {
+            if set.revision != 1
+                || set.previous_roster_hash != [0; 32]
+                || set.approving_device.is_some()
+                || !set.approving_device_signature.is_empty()
+                || set.devices.len() != 1
+                || set.devices[0].device_id != set.genesis.initial_device_key
+            {
+                anyhow::bail!("invalid genesis roster")
+            }
+        }
+        AccountTransitionKind::DeviceAndRecovery => {
+            let approver = set.approving_device.ok_or_else(|| {
+                anyhow::anyhow!("device-and-recovery transition lacks an approving device")
+            })?;
+            VerifyingKey::from_bytes(&approver)?
+                .verify(&bytes, &signature(&set.approving_device_signature)?)?;
+        }
+        AccountTransitionKind::Recovery => {
+            if set.approving_device.is_some() || !set.approving_device_signature.is_empty() {
+                anyhow::bail!("recovery transition must not impersonate an authorized device")
+            }
+        }
+    }
     for device in &set.devices {
         if device.identity != set.identity {
             anyhow::bail!("device belongs to another identity")
         }
-        verify_device(device)?;
+        verify_device_with_genesis(device, &set.genesis)?;
+    }
+    Ok(())
+}
+
+pub fn verify_roster_transition(
+    previous: &AuthorizedDeviceSet,
+    next: &AuthorizedDeviceSet,
+) -> Result<()> {
+    verify_device_set(previous)?;
+    verify_device_set(next)?;
+    if previous.identity != next.identity
+        || previous.genesis != next.genesis
+        || next.revision != previous.revision + 1
+        || next.previous_roster_hash != roster_hash(previous)
+    {
+        anyhow::bail!("invalid account roster transition ancestry")
+    }
+    match next.transition {
+        AccountTransitionKind::DeviceAndRecovery => {
+            let approver = next.approving_device.expect("checked by verifier");
+            if !previous
+                .devices
+                .iter()
+                .any(|device| device.device_id == approver)
+            {
+                anyhow::bail!("account roster transition approver was not previously authorized")
+            }
+        }
+        AccountTransitionKind::Recovery => {}
+        AccountTransitionKind::Genesis => {
+            anyhow::bail!("genesis roster cannot replace an established account")
+        }
     }
     Ok(())
 }
 fn revocation_bytes(revocation: &DeviceRevocation) -> Vec<u8> {
     bincode::serialize(&(
         revocation.identity,
+        &revocation.genesis,
         revocation.device_id,
         revocation.revision,
     ))
@@ -498,6 +718,7 @@ fn revocation_bytes(revocation: &DeviceRevocation) -> Vec<u8> {
 fn routing_bytes(route: &RoutingRecord) -> Vec<u8> {
     bincode::serialize(&(
         route.identity,
+        &route.genesis,
         route.version,
         &route.server,
         route.revision,
@@ -541,6 +762,7 @@ pub fn verify_relay_forward(forward: &RelayForward) -> Result<()> {
 }
 pub fn make_routing(
     root: &SigningKey,
+    genesis: PigeonAccountGenesis,
     server: String,
     relay_identity: [u8; 32],
     tls_spki_fingerprint: [u8; 32],
@@ -548,8 +770,9 @@ pub fn make_routing(
     parent_revision: u64,
 ) -> RoutingRecord {
     let mut route = RoutingRecord {
-        version: 2,
-        identity: root.verifying_key().to_bytes(),
+        version: 3,
+        identity: account_id(&genesis).expect("validated genesis"),
+        genesis,
         server,
         revision,
         parent_revision,
@@ -561,7 +784,7 @@ pub fn make_routing(
     route
 }
 pub fn verify_routing(route: &RoutingRecord) -> Result<()> {
-    if route.version != 2
+    if route.version != 3
         || route.relay_identity == [0; 32]
         || route.tls_spki_fingerprint == [0; 32]
         || route.revision == 0
@@ -569,7 +792,11 @@ pub fn verify_routing(route: &RoutingRecord) -> Result<()> {
     {
         anyhow::bail!("invalid routing revision ancestry")
     }
-    VerifyingKey::from_bytes(&route.identity)?
+    verify_genesis(&route.genesis)?;
+    if route.identity != account_id(&route.genesis)? {
+        anyhow::bail!("routing record identity does not match account genesis")
+    }
+    VerifyingKey::from_bytes(&route.genesis.root_public_key)?
         .verify(&routing_bytes(route), &signature(&route.signature)?)
         .map_err(Into::into)
 }
@@ -589,9 +816,15 @@ pub fn routing_precedes(left: &RoutingRecord, right: &RoutingRecord) -> bool {
     bincode::serialize(left).expect("serializable route")
         < bincode::serialize(right).expect("serializable route")
 }
-pub fn make_revocation(root: &SigningKey, device_id: [u8; 32], revision: u64) -> DeviceRevocation {
+pub fn make_revocation(
+    root: &SigningKey,
+    genesis: PigeonAccountGenesis,
+    device_id: [u8; 32],
+    revision: u64,
+) -> DeviceRevocation {
     let mut revocation = DeviceRevocation {
-        identity: root.verifying_key().to_bytes(),
+        identity: account_id(&genesis).expect("validated genesis"),
+        genesis,
         device_id,
         revision,
         signature: vec![0; 64],
@@ -603,93 +836,72 @@ pub fn make_revocation(root: &SigningKey, device_id: [u8; 32], revision: u64) ->
     revocation
 }
 pub fn verify_revocation(revocation: &DeviceRevocation) -> Result<()> {
-    VerifyingKey::from_bytes(&revocation.identity)?
+    verify_genesis(&revocation.genesis)?;
+    if revocation.identity != account_id(&revocation.genesis)? {
+        anyhow::bail!("revocation identity does not match account genesis")
+    }
+    VerifyingKey::from_bytes(&revocation.genesis.root_public_key)?
         .verify(
             &revocation_bytes(revocation),
             &signature(&revocation.signature)?,
         )
         .map_err(Into::into)
 }
-pub fn make_card(
+/// Construct the public signed profile from a separately authenticated account
+/// roster.  Production callers must use this rather than manufacturing a
+/// roster with root authority alone.
+pub fn make_card_from_roster(
     signing: &SigningKey,
+    genesis: PigeonAccountGenesis,
     encryption: &StaticSecret,
     server: String,
-    device: DeviceRecord,
-) -> ContactCard {
-    make_card_named(signing, encryption, server, device, "Unnamed".into())
-}
-pub fn make_card_named(
-    signing: &SigningKey,
-    encryption: &StaticSecret,
-    server: String,
-    device: DeviceRecord,
+    roster: AuthorizedDeviceSet,
+    revision: u64,
     display_name: String,
-) -> ContactCard {
+) -> Result<ContactCard> {
+    verify_device_set(&roster)?;
+    if roster.genesis != genesis || roster.identity != account_id(&genesis)? {
+        anyhow::bail!("contact card roster belongs to another account genesis")
+    }
     let mut card = ContactCard {
-        profile_version: 1,
+        profile_version: 2,
         signing_key: signing.verifying_key().to_bytes(),
+        genesis,
         encryption_key: PublicKey::from(encryption).to_bytes(),
         server,
-        revision: 1,
-        devices: vec![device],
+        revision,
+        devices: roster.devices.clone(),
+        authorized_devices: roster,
         display_name,
         signature: vec![0; 64],
     };
     card.signature = signing.sign(&card_bytes(&card)).to_bytes().to_vec();
-    card
-}
-/// Produce a new root-signed contact card after an authorized roster change.
-pub fn make_card_with_devices(
-    signing: &SigningKey,
-    encryption: &StaticSecret,
-    server: String,
-    devices: Vec<DeviceRecord>,
-    revision: u64,
-) -> ContactCard {
-    make_card_with_devices_named(
-        signing,
-        encryption,
-        server,
-        devices,
-        revision,
-        "Unnamed".into(),
-    )
-}
-pub fn make_card_with_devices_named(
-    signing: &SigningKey,
-    encryption: &StaticSecret,
-    server: String,
-    devices: Vec<DeviceRecord>,
-    revision: u64,
-    display_name: String,
-) -> ContactCard {
-    let mut card = ContactCard {
-        profile_version: 1,
-        signing_key: signing.verifying_key().to_bytes(),
-        encryption_key: PublicKey::from(encryption).to_bytes(),
-        server,
-        revision,
-        devices,
-        display_name,
-        signature: vec![0; 64],
-    };
-    card.signature = signing.sign(&card_bytes(&card)).to_bytes().to_vec();
-    card
+    Ok(card)
 }
 pub fn verify_card(card: &ContactCard) -> Result<()> {
-    if card.profile_version > 1
-        || (card.profile_version == 1
-            && (card.display_name.trim().is_empty() || card.display_name.chars().count() > 64))
+    if card.profile_version != 2
+        || card.display_name.trim().is_empty()
+        || card.display_name.chars().count() > 64
     {
         anyhow::bail!("invalid contact profile display name")
     }
-    VerifyingKey::from_bytes(&card.signing_key)?
+    verify_genesis(&card.genesis)?;
+    if card.signing_key != card.genesis.root_public_key {
+        anyhow::bail!("contact card root key does not match account genesis")
+    }
+    verify_device_set(&card.authorized_devices)?;
+    if card.authorized_devices.identity != identity_id(card)
+        || card.authorized_devices.devices != card.devices
+    {
+        anyhow::bail!("contact card roster does not match its authenticated account state")
+    }
+    VerifyingKey::from_bytes(&card.genesis.root_public_key)?
         .verify(&card_bytes(card), &signature(&card.signature)?)?;
     for device in &card.devices {
-        if device.identity != card.signing_key {
+        if device.identity != identity_id(card) {
             anyhow::bail!("contact card contains a device from another identity")
         }
-        verify_device(device)?;
+        verify_device_with_genesis(device, &card.genesis)?;
     }
     Ok(())
 }
@@ -707,6 +919,21 @@ mod tests {
     use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_rust_crypto::OpenMlsRustCrypto;
+
+    fn test_genesis(
+        root: &SigningKey,
+        recovery: &SigningKey,
+        device: &SigningKey,
+    ) -> PigeonAccountGenesis {
+        PigeonAccountGenesis {
+            version: ACCOUNT_GENESIS_VERSION,
+            root_public_key: root.verifying_key().to_bytes(),
+            initial_device_key: device.verifying_key().to_bytes(),
+            recovery_public_key: recovery.verifying_key().to_bytes(),
+            nonce: [7; 32],
+            initial_display_name: "Test account".into(),
+        }
+    }
 
     #[test]
     fn openmls_two_member_application_message() {
@@ -768,17 +995,37 @@ mod tests {
     #[test]
     fn root_authorizes_two_distinct_devices_across_restart_serialization() {
         let root = SigningKey::generate(&mut rand_core::OsRng);
+        let recovery = SigningKey::generate(&mut rand_core::OsRng);
         let phone = SigningKey::generate(&mut rand_core::OsRng);
         let laptop = SigningKey::generate(&mut rand_core::OsRng);
-        let phone_record = make_device(&root, &phone, vec![1, 2, 3]);
-        let laptop_record = make_device(&root, &laptop, vec![4, 5, 6]);
+        let genesis = test_genesis(&root, &recovery, &phone);
+        let identity = account_id(&genesis).unwrap();
+        let phone_record = make_device(&root, identity, &phone, vec![1, 2, 3]);
+        let laptop_record = make_device(&root, identity, &laptop, vec![4, 5, 6]);
         assert_ne!(phone_record.device_id, laptop_record.device_id);
         assert_ne!(phone_record.device_key, laptop_record.device_key);
-        let roster = AuthorizedDeviceSet {
-            identity: root.verifying_key().to_bytes(),
-            revision: 2,
-            devices: vec![phone_record, laptop_record],
-        };
+        let initial = make_authorized_device_set(
+            genesis.clone(),
+            &root,
+            &recovery,
+            vec![phone_record.clone()],
+            1,
+            None,
+            None,
+            AccountTransitionKind::Genesis,
+        )
+        .unwrap();
+        let roster = make_authorized_device_set(
+            genesis,
+            &root,
+            &recovery,
+            vec![phone_record, laptop_record],
+            2,
+            Some(&initial),
+            Some((&phone, phone.verifying_key().to_bytes())),
+            AccountTransitionKind::DeviceAndRecovery,
+        )
+        .unwrap();
         verify_device_set(&roster).unwrap();
         let restored: AuthorizedDeviceSet = decode(&encode(&roster).unwrap()).unwrap();
         verify_device_set(&restored).unwrap();
@@ -919,12 +1166,15 @@ mod tests {
     fn pairing_approval_and_hpke_bootstrap_reject_all_bound_tampering() {
         use hpke::Kem as _;
         let root = SigningKey::generate(&mut rand_core::OsRng);
+        let recovery = SigningKey::generate(&mut rand_core::OsRng);
         let device = SigningKey::generate(&mut rand_core::OsRng);
-        let record = make_device(&root, &device, vec![1, 2, 3]);
+        let genesis = test_genesis(&root, &recovery, &device);
+        let identity = account_id(&genesis).unwrap();
+        let record = make_device(&root, identity, &device, vec![1, 2, 3]);
         let (sk, pk) = X25519HkdfSha256::gen_keypair();
         let request = PairingRequest {
             version: PAIRING_VERSION,
-            identity: root.verifying_key().to_bytes(),
+            identity,
             session_id: [1; 16],
             nonce: [2; 16],
             expires_at: 100,
@@ -937,11 +1187,17 @@ mod tests {
         let payload = BootstrapPayload {
             version: PAIRING_VERSION,
             root_secret: root.to_bytes(),
-            roster: AuthorizedDeviceSet {
-                identity: request.identity,
-                revision: 2,
-                devices: vec![record.clone()],
-            },
+            roster: make_authorized_device_set(
+                genesis,
+                &root,
+                &recovery,
+                vec![record.clone()],
+                1,
+                None,
+                None,
+                AccountTransitionKind::Genesis,
+            )
+            .unwrap(),
             routing: None,
             contacts: vec![],
             control_state: vec![9],
@@ -987,8 +1243,12 @@ mod tests {
             assert!(verify_pairing_approval(&altered, &approval, 99).is_err());
         }
         let mut wrong_device = request.clone();
-        wrong_device.device =
-            make_device(&root, &SigningKey::generate(&mut rand_core::OsRng), vec![4]);
+        wrong_device.device = make_device(
+            &root,
+            identity,
+            &SigningKey::generate(&mut rand_core::OsRng),
+            vec![4],
+        );
         assert!(verify_pairing_approval(&wrong_device, &approval, 99).is_err());
         let mut changed = approval.clone();
         changed.roster_revision += 1;
@@ -1035,5 +1295,71 @@ mod tests {
         ] {
             assert!(verify_relay_descriptor(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn genesis_is_canonical_and_root_reuse_does_not_merge_accounts() {
+        let root = SigningKey::generate(&mut rand_core::OsRng);
+        let recovery = SigningKey::generate(&mut rand_core::OsRng);
+        let device = SigningKey::generate(&mut rand_core::OsRng);
+        let genesis = test_genesis(&root, &recovery, &device);
+        assert_eq!(account_id(&genesis).unwrap(), account_id(&genesis).unwrap());
+        let other = PigeonAccountGenesis {
+            nonce: [8; 32],
+            ..genesis.clone()
+        };
+        assert_ne!(account_id(&genesis).unwrap(), account_id(&other).unwrap());
+        assert!(verify_genesis(&PigeonAccountGenesis {
+            version: 99,
+            ..genesis
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn established_roster_rejects_root_only_and_self_approved_enrollment() {
+        let root = SigningKey::generate(&mut rand_core::OsRng);
+        let recovery = SigningKey::generate(&mut rand_core::OsRng);
+        let first = SigningKey::generate(&mut rand_core::OsRng);
+        let second = SigningKey::generate(&mut rand_core::OsRng);
+        let genesis = test_genesis(&root, &recovery, &first);
+        let identity = account_id(&genesis).unwrap();
+        let initial_device = make_device(&root, identity, &first, vec![1]);
+        let initial = make_authorized_device_set(
+            genesis.clone(),
+            &root,
+            &recovery,
+            vec![initial_device.clone()],
+            1,
+            None,
+            None,
+            AccountTransitionKind::Genesis,
+        )
+        .unwrap();
+        let new_device = make_device(&root, identity, &second, vec![2]);
+        let root_only = AuthorizedDeviceSet {
+            identity,
+            genesis: genesis.clone(),
+            revision: 2,
+            devices: vec![initial_device.clone(), new_device.clone()],
+            previous_roster_hash: roster_hash(&initial),
+            transition: AccountTransitionKind::DeviceAndRecovery,
+            approving_device: Some(first.verifying_key().to_bytes()),
+            root_signature: vec![],
+            recovery_signature: vec![],
+            approving_device_signature: vec![],
+        };
+        assert!(verify_device_set(&root_only).is_err());
+        let self_approved = make_authorized_device_set(
+            genesis,
+            &root,
+            &recovery,
+            vec![initial_device, new_device],
+            2,
+            Some(&initial),
+            Some((&second, second.verifying_key().to_bytes())),
+            AccountTransitionKind::DeviceAndRecovery,
+        );
+        assert!(self_approved.is_err());
     }
 }
