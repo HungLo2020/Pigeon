@@ -48,6 +48,20 @@ def architecture() -> str:
     return subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
 
 
+def clear_previous_output(output: Path, version: str, arch: str, client: bool, server: bool) -> None:
+    """Prevent a failed rebuild from leaving a same-version artifact publishable."""
+    names: list[str] = []
+    if client:
+        names.append(f"pigeon-client_{version}_{arch}.deb")
+    if server:
+        names.append(f"pigeon-server_{version}_{arch}.deb")
+    for name in names:
+        previous = output / name
+        if previous.exists():
+            print(f"Removing previous package output {previous}")
+            previous.unlink()
+
+
 def replace_control_field(control: Path, name: str, value: str) -> None:
     lines = control.read_text().splitlines()
     prefix = f"{name}:"
@@ -236,9 +250,11 @@ def main() -> int:
     arch = architecture()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-
-    client = build_client(output, version, arch) if not args.server else None
-    server = build_server(output, version, arch) if not args.client else None
+    build_client_package = not args.server
+    build_server_package = not args.client
+    clear_previous_output(output, version, arch, build_client_package, build_server_package)
+    client = build_client(output, version, arch) if build_client_package else None
+    server = build_server(output, version, arch) if build_server_package else None
     validate(client, server)
     for package in (client, server):
         if package is not None:
