@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -132,6 +133,90 @@ def verify_and_download(package: str) -> tuple[Path, tempfile.TemporaryDirectory
         raise
 
 
+@dataclass(frozen=True)
+class RelayServiceState:
+    unit_exists: bool
+    configured: bool
+    active: bool
+    pid: int | None
+    start_time: str | None
+
+
+def sudo_output(*command: str) -> str:
+    """Run a read-only system command through sudo and return stripped output."""
+    return subprocess.check_output(["sudo", *command], text=True).strip()
+
+
+def relay_service_state() -> RelayServiceState:
+    """Capture relay state without treating an intentionally stopped unit as an error."""
+    try:
+        load_state = sudo_output("systemctl", "show", "--property=LoadState", "--value", "pigeon-server")
+    except subprocess.CalledProcessError as error:
+        raise fail(f"could not inspect pigeon-server.service before installation (exit {error.returncode})") from error
+    unit_exists = load_state not in {"", "not-found"}
+    configured = subprocess.run(
+        ["sudo", "test", "-f", "/etc/pigeon/pigeon-server.conf"], check=False
+    ).returncode == 0
+    active = subprocess.run(
+        ["sudo", "systemctl", "is-active", "--quiet", "pigeon-server"], check=False
+    ).returncode == 0
+    if not active:
+        return RelayServiceState(unit_exists, configured, False, None, None)
+    try:
+        pid = int(sudo_output("systemctl", "show", "--property=MainPID", "--value", "pigeon-server"))
+        start_time = sudo_output(
+            "systemctl", "show", "--property=ExecMainStartTimestamp", "--value", "pigeon-server"
+        )
+    except (ValueError, subprocess.CalledProcessError) as error:
+        raise fail("pigeon-server.service is active but does not expose a valid main PID") from error
+    if pid <= 0:
+        raise fail("pigeon-server.service is active but has no main PID")
+    return RelayServiceState(unit_exists, configured, True, pid, start_time or None)
+
+
+def reload_and_restart_relay(before: RelayServiceState) -> RelayServiceState:
+    """Reload packaged unit metadata and restart only an active configured relay."""
+    try:
+        subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    except subprocess.CalledProcessError as error:
+        raise fail(f"systemctl daemon-reload failed after server installation (exit {error.returncode})") from error
+
+    after_install = relay_service_state()
+    if not after_install.unit_exists:
+        raise fail(
+            "pigeon-server.service is missing after package installation; the installed package is invalid"
+        )
+    # Package maintainer scripts must not override an operator's intentional
+    # stop. Correct that defensively so an upgrade preserves service state.
+    if not before.active and after_install.active:
+        try:
+            subprocess.run(["sudo", "systemctl", "stop", "pigeon-server"], check=True)
+        except subprocess.CalledProcessError as error:
+            raise fail(f"could not restore the intentionally stopped relay state (exit {error.returncode})") from error
+        after_install = relay_service_state()
+        if after_install.active:
+            raise fail("pigeon-server.service remained active despite restoring its pre-upgrade stopped state")
+    if before.configured and before.active:
+        try:
+            subprocess.run(["sudo", "systemctl", "restart", "pigeon-server"], check=True)
+        except subprocess.CalledProcessError as error:
+            raise fail(f"pigeon-server.service restart failed after installation (exit {error.returncode})") from error
+        after_restart = relay_service_state()
+        if not after_restart.active:
+            raise fail("pigeon-server.service did not become active after restart")
+        if after_restart.pid == before.pid:
+            raise fail(
+                "pigeon-server.service PID did not change after restart; refusing to claim the new binary is running"
+            )
+        print(
+            "Relay restarted onto the installed binary: "
+            f"state=active pid={after_restart.pid} (previous pid={before.pid})"
+            f" start={after_restart.start_time or 'unknown'}."
+        )
+        return after_restart
+    return after_install
+
+
 def install(package: str, server: bool) -> int:
     parser = argparse.ArgumentParser(description=f"Install Pigeon's latest {package} Debian package.")
     parser.add_argument("--verify-only", action="store_true", help="download and verify, but do not invoke apt")
@@ -143,21 +228,27 @@ def install(package: str, server: bool) -> int:
         if args.verify_only:
             print(f"Verified {deb.name}; apt installation skipped.")
             return 0
+        before = relay_service_state() if server else None
+        if before is not None:
+            state = "active" if before.active else "stopped"
+            pid = f" pid={before.pid}" if before.pid is not None else ""
+            configured = "configured" if before.configured else "unconfigured"
+            unit = "present" if before.unit_exists else "missing"
+            print(f"Pre-upgrade relay: unit={unit} {configured} state={state}{pid}.")
         print(f"Installing {deb.name} with apt (sudo may prompt for your password)...")
-        subprocess.run(["sudo", "apt", "install", "--reinstall", "-y", str(deb)], check=True)
+        try:
+            subprocess.run(["sudo", "apt", "install", "--reinstall", "-y", str(deb)], check=True)
+        except subprocess.CalledProcessError as error:
+            raise fail(f"apt failed while installing {deb.name} (exit {error.returncode})") from error
         if server:
-            config = Path("/etc/pigeon/pigeon-server.conf")
-            # /etc/pigeon is intentionally not traversable by ordinary users,
-            # so verify its presence through the same sudo authority used for
-            # apt rather than reporting a configured relay as fresh.
-            configured = subprocess.run(["sudo", "test", "-f", str(config)], check=False).returncode == 0
-            if configured:
-                print("Existing relay configuration was retained. Check it with: systemctl status pigeon-server")
+            assert before is not None
+            after = reload_and_restart_relay(before)
+            if after.configured:
+                if not before.active:
+                    print("Existing relay configuration was retained; the relay was stopped before upgrade and remains stopped.")
             else:
                 print("Relay package installed but not configured. Next step: sudo pigeon-setup")
         print(f"Installed Pigeon {package} from latest commit {metadata.get('target_commitish', 'unknown')}.")
         return 0
-    except subprocess.CalledProcessError as error:
-        raise fail(f"apt failed while installing {deb.name} (exit {error.returncode})") from error
     finally:
         temporary.cleanup()

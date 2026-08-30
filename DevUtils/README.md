@@ -29,6 +29,11 @@ fresh relay installation it prints the required next step:
 sudo pigeon-setup
 ```
 
+For an already configured, active relay, the server installer reloads systemd
+and restarts `pigeon-server` after the package upgrade, then verifies a new
+active PID. A configured relay that was intentionally stopped remains stopped;
+a fresh package installation is never started by the installer.
+
 Use `--verify-only` with either installer to exercise release discovery,
 download, and checksum verification without invoking `apt`.
 
