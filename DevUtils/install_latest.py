@@ -147,7 +147,11 @@ def install(package: str, server: bool) -> int:
         subprocess.run(["sudo", "apt", "install", "--reinstall", "-y", str(deb)], check=True)
         if server:
             config = Path("/etc/pigeon/pigeon-server.conf")
-            if config.exists():
+            # /etc/pigeon is intentionally not traversable by ordinary users,
+            # so verify its presence through the same sudo authority used for
+            # apt rather than reporting a configured relay as fresh.
+            configured = subprocess.run(["sudo", "test", "-f", str(config)], check=False).returncode == 0
+            if configured:
                 print("Existing relay configuration was retained. Check it with: systemctl status pigeon-server")
             else:
                 print("Relay package installed but not configured. Next step: sudo pigeon-setup")
