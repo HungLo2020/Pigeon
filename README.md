@@ -111,6 +111,33 @@ state below `/var/lib/pigeon`, write `/etc/pigeon/pigeon-server.conf`, and then
 enable the relay. The package never stores mutable state below `/usr`; relay
 logs are available through `journalctl -u pigeon-server`.
 
+## Linux desktop client daemon
+
+On Linux, `pigeon-client` also installs `pigeon-client-daemon` and the
+`pigeon-client-daemon.service` systemd **user** unit. The daemon runs as the
+logged-in user, never as root. It is the sole owner of local account files,
+relay connections, MLS processing, sync, history writes, and background
+delivery. The Tauri app is only a typed local IPC client and reconnects to the
+daemon after a restart; closing its window does not stop recent-message sync.
+
+The socket is `$XDG_RUNTIME_DIR/pigeon/pigeon-client.sock`, inside a `0700`
+directory with a `0600` socket and same-UID peer validation. Client data lives
+in `$XDG_DATA_HOME/pigeon` (or `~/.local/share/pigeon`). The package never
+globally enables another local user's daemon. `InstallLatestClient.py` enables
+the user unit for the installing desktop user on a fresh install; it can be
+managed with:
+
+```bash
+systemctl --user status pigeon-client-daemon
+systemctl --user restart pigeon-client-daemon
+journalctl --user -u pigeon-client-daemon
+```
+
+When no GUI is connected, a newly synchronized message produces a
+privacy-preserving desktop notification with no message preview. Development
+profiles use an independent data directory and daemon socket through
+`python3 DevUtils/RunClient.py --profile alice`.
+
 ## Relay discovery and first contact
 
 Relay selection accepts an explicit `host:port` (including a direct IP), a

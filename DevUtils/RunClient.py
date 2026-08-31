@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import re
+import socket
 from pathlib import Path
 
 
@@ -37,6 +38,43 @@ def run(command: list[str], environment: dict[str, str]) -> int:
             return child.wait()
 
 
+def daemon_running(socket_path: Path) -> bool:
+    if not socket_path.exists():
+        return False
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(0.2)
+        client.connect(str(socket_path))
+        return True
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+
+def start_daemon(binary: Path, environment: dict[str, str], data_dir: Path, socket_path: Path) -> bool:
+    if daemon_running(socket_path):
+        return True
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [str(binary), "--data-dir", str(data_dir), "--socket", str(socket_path)],
+            cwd=ROOT,
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"RunClient.py: could not start pigeon-client-daemon: {error}", file=sys.stderr)
+        return False
+    for _ in range(30):
+        if daemon_running(socket_path):
+            return True
+        import time
+        time.sleep(0.1)
+    print("RunClient.py: daemon did not create its IPC socket.", file=sys.stderr)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true", help="run Tauri in release mode")
@@ -61,21 +99,39 @@ def main() -> int:
         build.append("--release")
     if subprocess.run(build, cwd=ROOT).returncode:
         return 1
+    daemon_build = ["cargo", "build", "-p", "pigeon-client-daemon"]
+    if args.release:
+        daemon_build.append("--release")
+    if subprocess.run(daemon_build, cwd=ROOT).returncode:
+        return 1
     tauri_build = ["cargo", "build", "-p", "pigeon-tauri"]
     if args.release:
         tauri_build.append("--release")
     if subprocess.run(tauri_build, cwd=ROOT).returncode:
         return 1
     core_binary = ROOT / "target" / profile / "pigeon-client"
+    daemon_binary = ROOT / "target" / profile / "pigeon-client-daemon"
     environment = os.environ.copy()
     if args.profile:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args.profile):
             print("RunClient.py: profile may contain only letters, digits, '_' and '-'.", file=sys.stderr)
             return 2
-        profile_data = ROOT / "DevUtils" / "profiles" / args.profile
+        profile_root = ROOT / "DevUtils" / "profiles" / args.profile
+        profile_data = profile_root / "data"
+        profile_runtime = profile_root / "runtime"
         profile_data.mkdir(parents=True, exist_ok=True)
+        profile_runtime.mkdir(parents=True, exist_ok=True)
+        profile_runtime.chmod(0o700)
         environment["XDG_DATA_HOME"] = str(profile_data)
+        environment["XDG_RUNTIME_DIR"] = str(profile_runtime)
+        environment["PIGEON_DATA_DIR"] = str(profile_data / "pigeon")
     environment["PIGEON_CLIENT_BIN"] = str(core_binary)
+    environment["PIGEON_CLIENT_DAEMON_BIN"] = str(daemon_binary)
+    data_home = Path(environment.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    data_dir = Path(environment.get("PIGEON_DATA_DIR", str(data_home / "pigeon")))
+    runtime_dir = Path(environment.get("XDG_RUNTIME_DIR", "/tmp"))
+    daemon_socket = runtime_dir / "pigeon" / "pigeon-client.sock"
+    environment["PIGEON_DAEMON_SOCKET"] = str(daemon_socket)
     certificate = args.certificate or (LOCAL_RELAY_CERTIFICATE if LOCAL_RELAY_CERTIFICATE.exists() else None)
     if certificate is None:
         print(
@@ -92,14 +148,18 @@ def main() -> int:
     print("Starting Pigeon Tauri client")
     print(f"  Repository: {ROOT}")
     print(f"  Client core: {core_binary}")
+    print(f"  Background daemon: {daemon_binary}")
+    print(f"  Daemon IPC: {daemon_socket}")
     print(f"  Pinned relay certificate: {certificate}")
     if args.profile:
         print(f"  Profile: {args.profile}")
-        print(f"  Account state: {environment['XDG_DATA_HOME']} (preserved and isolated)")
+        print(f"  Account state: {data_dir} (preserved and isolated)")
     else:
         print("  Profile: default")
-        print("  Account state: normal Tauri application-data location (preserved between runs)")
+        print(f"  Account state: {data_dir} (preserved between runs)")
     print("  Stop with Ctrl+C.")
+    if not start_daemon(daemon_binary, environment, data_dir, daemon_socket):
+        return 1
     command = ["cargo", "tauri", "dev", "--config", "src/client/tauri/tauri.conf.json"]
     if args.release:
         command.append("--release")

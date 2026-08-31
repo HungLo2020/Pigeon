@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/shared", "src/server", "src/client/core", "src/client/tauri"]
+members = ["src/shared", "src/server", "src/client/core", "src/client/daemon", "src/client/tauri"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -25,6 +25,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.43", features = ["full"] }
 tokio-rustls = "0.26"
+libc = "0.2"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 x509-parser = "0.16"
 url = "2.5"

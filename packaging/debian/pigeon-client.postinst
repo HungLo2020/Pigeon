@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# A package maintainer script runs as root and must not enable a desktop
+# process for every user. Remove the legacy global enablement if an older
+# package created it; InstallLatestClient.py and the desktop app manage the
+# invoking user's unit through `systemctl --user` instead.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global disable pigeon-client-daemon.service >/dev/null 2>&1 || true
+fi

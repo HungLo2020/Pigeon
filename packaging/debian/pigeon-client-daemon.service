@@ -1,0 +1,15 @@
+[Unit]
+Description=Pigeon desktop client background daemon
+Documentation=https://github.com/HungLo2020/Pigeon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pigeon-client-daemon
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

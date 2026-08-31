@@ -21,3 +21,11 @@ After confirmation, normal connections use only the persisted signed relay and
 TLS-SPKI pins.
 
 Local history retention should be independently configurable, initially including 30 days, 90 days, 1 year, 5 years, and forever.
+
+## Linux desktop runtime
+
+`daemon/` is the Linux desktop owner of live account state. It serializes core
+operations, background sync, and history writes over a same-user Unix socket.
+The Tauri host consumes typed snapshots/events and does not directly read or
+mutate account files. Mobile hosts reuse core runtime behavior but are not
+required to use Unix IPC or systemd.

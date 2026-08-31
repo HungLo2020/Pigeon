@@ -142,6 +142,15 @@ class RelayServiceState:
     start_time: str | None
 
 
+@dataclass(frozen=True)
+class ClientDaemonState:
+    unit_exists: bool
+    active: bool
+    enabled: str
+    pid: int | None
+    start_time: str | None
+
+
 def sudo_output(*command: str) -> str:
     """Run a read-only system command through sudo and return stripped output."""
     return subprocess.check_output(["sudo", *command], text=True).strip()
@@ -217,6 +226,87 @@ def reload_and_restart_relay(before: RelayServiceState) -> RelayServiceState:
     return after_install
 
 
+def user_systemctl(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a command against the invoking desktop user's systemd manager."""
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *command], check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except FileNotFoundError as error:
+        raise fail("systemctl is required to manage the per-user Pigeon daemon") from error
+
+
+def client_daemon_state() -> ClientDaemonState:
+    try:
+        load = subprocess.check_output(
+            ["systemctl", "--user", "show", "--property=LoadState", "--value", "pigeon-client-daemon.service"],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError as error:
+        raise fail(f"could not inspect pigeon-client-daemon.service before installation (exit {error.returncode})") from error
+    exists = load not in {"", "not-found"}
+    enabled_result = user_systemctl("is-enabled", "pigeon-client-daemon.service", check=False)
+    enabled = enabled_result.stdout.strip() or "disabled"
+    active = user_systemctl("is-active", "--quiet", "pigeon-client-daemon.service", check=False).returncode == 0
+    if not active:
+        return ClientDaemonState(exists, False, enabled, None, None)
+    try:
+        details = subprocess.check_output(
+            [
+                "systemctl", "--user", "show", "pigeon-client-daemon.service",
+                "--property=MainPID", "--property=ExecMainStartTimestamp", "--value",
+            ],
+            text=True,
+        ).splitlines()
+        pid = int(details[0])
+        start_time = details[1] if len(details) > 1 else ""
+    except (ValueError, IndexError, subprocess.CalledProcessError) as error:
+        raise fail("pigeon-client-daemon.service is active but does not expose a valid main PID") from error
+    if pid <= 0:
+        raise fail("pigeon-client-daemon.service is active but has no main PID")
+    return ClientDaemonState(exists, True, enabled, pid, start_time or None)
+
+
+def reload_and_restart_client(before: ClientDaemonState) -> ClientDaemonState:
+    """Preserve per-user daemon intent across a package replacement."""
+    try:
+        user_systemctl("daemon-reload")
+    except subprocess.CalledProcessError as error:
+        raise fail(f"systemctl --user daemon-reload failed after client installation (exit {error.returncode})") from error
+    after_install = client_daemon_state()
+    if not after_install.unit_exists:
+        raise fail("pigeon-client-daemon.service is missing after package installation; the installed package is invalid")
+    if before.active:
+        try:
+            user_systemctl("restart", "pigeon-client-daemon.service")
+        except subprocess.CalledProcessError as error:
+            raise fail(f"pigeon-client-daemon.service restart failed after installation (exit {error.returncode})") from error
+        after_restart = client_daemon_state()
+        if not after_restart.active:
+            raise fail("pigeon-client-daemon.service did not become active after restart")
+        if after_restart.pid == before.pid:
+            raise fail("pigeon-client-daemon.service PID did not change after restart; refusing to claim the new binary is running")
+        print(
+            "Client daemon restarted onto the installed binary: "
+            f"state=active pid={after_restart.pid} (previous pid={before.pid})"
+            f" start={after_restart.start_time or 'unknown'}."
+        )
+        return after_restart
+    if not before.unit_exists:
+        try:
+            user_systemctl("enable", "--now", "pigeon-client-daemon.service")
+        except subprocess.CalledProcessError as error:
+            raise fail(f"could not enable/start pigeon-client-daemon.service for this user (exit {error.returncode})") from error
+        fresh = client_daemon_state()
+        if not fresh.active:
+            raise fail("fresh client daemon did not become active")
+        print(f"Client daemon enabled for this user and started: pid={fresh.pid}.")
+        return fresh
+    # An existing inactive unit is an intentional user choice. Never turn a
+    # package upgrade into a surprise background client process.
+    return after_install
+
+
 def install(package: str, server: bool) -> int:
     parser = argparse.ArgumentParser(description=f"Install Pigeon's latest {package} Debian package.")
     parser.add_argument("--verify-only", action="store_true", help="download and verify, but do not invoke apt")
@@ -228,13 +318,18 @@ def install(package: str, server: bool) -> int:
         if args.verify_only:
             print(f"Verified {deb.name}; apt installation skipped.")
             return 0
-        before = relay_service_state() if server else None
-        if before is not None:
+        before = relay_service_state() if server else client_daemon_state()
+        if server and before is not None:
             state = "active" if before.active else "stopped"
             pid = f" pid={before.pid}" if before.pid is not None else ""
             configured = "configured" if before.configured else "unconfigured"
             unit = "present" if before.unit_exists else "missing"
             print(f"Pre-upgrade relay: unit={unit} {configured} state={state}{pid}.")
+        elif isinstance(before, ClientDaemonState):
+            state = "active" if before.active else "stopped"
+            pid = f" pid={before.pid}" if before.pid is not None else ""
+            unit = "present" if before.unit_exists else "missing"
+            print(f"Pre-upgrade client daemon: unit={unit} state={state} enabled={before.enabled}{pid}.")
         print(f"Installing {deb.name} with apt (sudo may prompt for your password)...")
         try:
             subprocess.run(["sudo", "apt", "install", "--reinstall", "-y", str(deb)], check=True)
@@ -248,6 +343,11 @@ def install(package: str, server: bool) -> int:
                     print("Existing relay configuration was retained; the relay was stopped before upgrade and remains stopped.")
             else:
                 print("Relay package installed but not configured. Next step: sudo pigeon-setup")
+        else:
+            assert isinstance(before, ClientDaemonState)
+            after = reload_and_restart_client(before)
+            if before.unit_exists and not before.active:
+                print("Existing client daemon was stopped before upgrade and remains stopped.")
         print(f"Installed Pigeon {package} from latest commit {metadata.get('target_commitish', 'unknown')}.")
         return 0
     finally:

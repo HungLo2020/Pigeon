@@ -2,14 +2,15 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs, thread,
+    io::{BufRead, BufReader},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::Emitter;
 
 mod account_store;
 mod state_mapping;
-use account_store::{app_data, core, index, save_index, state_path};
+use account_store::{core, index, save_index, snapshot, subscribe};
 use state_mapping::{hex_bytes, sort_conversations, unread_count};
 
 #[derive(Serialize, Clone)]
@@ -125,7 +126,14 @@ fn default_appearance() -> String {
 
 #[tauri::command]
 fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
-    let account_index = index(&app)?;
+    let daemon_snapshot = snapshot(&app)?;
+    let account_index: AccountIndex = serde_json::from_value(
+        daemon_snapshot
+            .get("index")
+            .cloned()
+            .ok_or("daemon snapshot lacks account index")?,
+    )
+    .map_err(|error| error.to_string())?;
     if account_index.selected.is_none() {
         return Ok(AccountStatus {
             state_exists: false,
@@ -146,8 +154,7 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             display_name: None,
         });
     }
-    let path = state_path(&app)?;
-    if !path.exists() {
+    let Some(value) = daemon_snapshot.get("state").cloned() else {
         return Ok(AccountStatus {
             state_exists: false,
             identity: None,
@@ -162,14 +169,13 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
             accounts: account_index.accounts,
             selected_account: account_index.selected,
             needs_relay: false,
-            pairing: pairing_status(&app).ok().flatten(),
+            pairing: pairing_status_from_snapshot(&daemon_snapshot)
+                .ok()
+                .flatten(),
             appearance: account_index.appearance,
             display_name: None,
         });
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    };
     let identity = value
         .pointer("/authorized_devices/identity")
         .map(|key| hex_bytes(Some(key)));
@@ -370,7 +376,9 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         accounts: account_index.accounts,
         selected_account: account_index.selected,
         needs_relay: value.get("routing").is_none(),
-        pairing: pairing_status(&app).ok().flatten(),
+        pairing: pairing_status_from_snapshot(&daemon_snapshot)
+            .ok()
+            .flatten(),
         appearance: account_index.appearance,
         display_name: value
             .get("card")
@@ -380,15 +388,12 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
     })
 }
 
-fn pairing_status(app: &tauri::AppHandle) -> Result<Option<PairingStatus>, String> {
-    let path = state_path(app)?;
-    let pending = path.with_extension("json.pairing");
-    if !pending.exists() {
+fn pairing_status_from_snapshot(
+    snapshot: &serde_json::Value,
+) -> Result<Option<PairingStatus>, String> {
+    let Some(value) = snapshot.get("pairing") else {
         return Ok(None);
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&pending).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    };
     let request = value
         .get("request")
         .ok_or("pending pairing request is missing")?;
@@ -435,9 +440,6 @@ fn create_account(
             .map_err(|e| e.to_string())?
             .as_nanos()
     );
-    let path = app_data(&app)?.join("accounts").join(format!("{id}.json"));
-    fs::create_dir_all(path.parent().ok_or("missing account parent")?)
-        .map_err(|e| e.to_string())?;
     let mut account_index = index(&app)?;
     account_index.selected = Some(id.clone());
     save_index(&app, &account_index)?;
@@ -451,9 +453,10 @@ fn create_account(
             password,
         ],
     )?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    let value = snapshot(&app)?
+        .get("state")
+        .cloned()
+        .ok_or("daemon did not persist the new account")?;
     let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     account_index.accounts.push(AccountEntry {
         id,
@@ -602,9 +605,6 @@ fn import_account(app: tauri::AppHandle, backup: String, password: String) -> Re
             .map_err(|e| e.to_string())?
             .as_nanos()
     );
-    let path = app_data(&app)?.join("accounts").join(format!("{id}.json"));
-    fs::create_dir_all(path.parent().ok_or("missing account parent")?)
-        .map_err(|e| e.to_string())?;
     let mut account_index = index(&app)?;
     let previous_selected = account_index.selected.clone();
     account_index.selected = Some(id.clone());
@@ -621,12 +621,12 @@ fn import_account(app: tauri::AppHandle, backup: String, password: String) -> Re
     ) {
         account_index.selected = previous_selected;
         save_index(&app, &account_index)?;
-        let _ = fs::remove_file(&path);
         return Err(error);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    let value = snapshot(&app)?
+        .get("state")
+        .cloned()
+        .ok_or("daemon did not persist the imported account")?;
     let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     account_index.accounts.push(AccountEntry {
         id,
@@ -721,10 +721,10 @@ fn consume_pairing(app: tauri::AppHandle) -> Result<(), String> {
         .selected
         .clone()
         .ok_or("no pairing account selected")?;
-    let path = state_path(&app)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    let value = snapshot(&app)?
+        .get("state")
+        .cloned()
+        .ok_or("daemon did not persist paired account state")?;
     let identity = hex_bytes(value.pointer("/authorized_devices/identity"));
     if let Some(account) = account_index
         .accounts
@@ -795,35 +795,23 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             thread::spawn(move || loop {
-                if let Ok(before) = account_status(handle.clone()) {
-                    // The protected relay operation is atomic fetch-and-consume. Retrying it
-                    // here is safe: before approval it changes nothing; after approval it
-                    // completes the local account exactly once and emits normal state.
-                    if !before.state_exists
-                        && before
-                            .pairing
-                            .as_ref()
-                            .is_some_and(|pairing| pairing.state == "waiting")
-                    {
-                        let _ = consume_pairing(handle.clone());
-                    }
-                    if before.state_exists {
-                        if let Err(error) = fetch_messages(handle.clone()) {
-                            eprintln!("Pigeon background sync failed: {error}");
-                            let _ = handle.emit("pigeon://sync-error", error);
+                match subscribe(&handle) {
+                    Ok(stream) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                            if let Ok(status) = account_status(handle.clone()) {
+                                let _ = handle.emit("pigeon://state", status);
+                            }
+                            line.clear();
                         }
                     }
-                    if let Ok(status) = account_status(handle.clone()) {
-                        // Avoid replacing the frontend DOM every polling cycle
-                        // when sync did not change account-visible state.
-                        if serde_json::to_string(&before).ok()
-                            != serde_json::to_string(&status).ok()
-                        {
-                            let _ = handle.emit("pigeon://state", status);
-                        }
+                    Err(error) => {
+                        eprintln!("Pigeon daemon connection failed: {error}");
+                        let _ = handle.emit("pigeon://sync-error", error);
+                        thread::sleep(Duration::from_secs(2));
                     }
                 }
-                thread::sleep(Duration::from_secs(8));
             });
             Ok(())
         })

@@ -76,6 +76,10 @@ def replace_control_field(control: Path, name: str, value: str) -> None:
 
 def build_client(output: Path, version: str, arch: str) -> Path:
     run("npm", "run", "build", "--prefix", "src/client/frontend")
+    # The daemon owns the live core state.  Keep its core helper private to
+    # the package rather than exporting another user-facing CLI command.
+    run("cargo", "build", "--locked", "--release", "-p", "pigeon-client")
+    run("cargo", "build", "--locked", "--release", "-p", "pigeon-client-daemon")
     run(
         "cargo",
         "tauri",
@@ -96,6 +100,25 @@ def build_client(output: Path, version: str, arch: str) -> Path:
         staging = Path(temporary) / "package"
         run("dpkg-deb", "--raw-extract", str(candidates[0]), str(staging))
         replace_control_field(staging / "DEBIAN/control", "Package", "pigeon-client")
+        control = staging / "DEBIAN/control"
+        control_text = control.read_text()
+        depends = next((line.removeprefix("Depends: ") for line in control_text.splitlines() if line.startswith("Depends: ")), "")
+        if "libnotify-bin" not in depends:
+            replace_control_field(control, "Depends", f"{depends}, libnotify-bin" if depends else "libnotify-bin")
+        daemon_dir = staging / "usr/bin"
+        core_dir = staging / "usr/lib/pigeon"
+        unit_dir = staging / "usr/lib/systemd/user"
+        daemon_dir.mkdir(parents=True, exist_ok=True)
+        core_dir.mkdir(parents=True, exist_ok=True)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "target/release/pigeon-client-daemon", daemon_dir / "pigeon-client-daemon")
+        shutil.copy2(ROOT / "target/release/pigeon-client", core_dir / "pigeon-client-core")
+        (daemon_dir / "pigeon-client-daemon").chmod(0o755)
+        (core_dir / "pigeon-client-core").chmod(0o755)
+        shutil.copy2(DEBIAN_PACKAGING / "pigeon-client-daemon.service", unit_dir / "pigeon-client-daemon.service")
+        (unit_dir / "pigeon-client-daemon.service").chmod(0o644)
+        shutil.copy2(DEBIAN_PACKAGING / "pigeon-client.postinst", staging / "DEBIAN/postinst")
+        (staging / "DEBIAN/postinst").chmod(0o755)
         run("dpkg-deb", "--build", "--root-owner-group", str(staging), str(destination))
     return destination
 
@@ -212,8 +235,16 @@ def validate(client: Path | None, server: Path | None) -> None:
     if client is not None:
         control = package_control(client)
         listing = package_listing(client)
-        if "Package: pigeon-client" not in control or "./usr/bin/pigeon-tauri" not in listing:
+        scripts = control_members(client)
+        required = ("./usr/bin/pigeon-tauri", "./usr/bin/pigeon-client-daemon", "./usr/lib/pigeon/pigeon-client-core", "./usr/lib/systemd/user/pigeon-client-daemon.service")
+        if "Package: pigeon-client" not in control or any(value not in listing for value in required) or "postinst" not in scripts:
             raise RuntimeError("pigeon-client package does not contain the expected Tauri application")
+        archive = subprocess.check_output(["dpkg-deb", "--ctrl-tarfile", str(client)])
+        with tarfile.open(fileobj=BytesIO(archive)) as control_archive:
+            postinst = control_archive.extractfile("./postinst")
+            postinst_text = postinst.read().decode() if postinst is not None else ""
+        if "systemctl --global enable" in postinst_text:
+            raise RuntimeError("pigeon-client package must not globally enable a per-user daemon")
     if server is not None:
         control = package_control(server).lower()
         listing = package_listing(server).lower()
