@@ -1,5 +1,6 @@
 export type Contact = { id: string; compact_id: string; server: string; display_name: string; nickname?: string };
-export type Message = { conversation: string; sender: string; text: string; timestamp: number };
+export type Attachment = { id: string; filename: string; mime_type: string; size: number; complete: boolean; state: "pending" | "available" };
+export type Message = { conversation: string; sender: string; text: string; timestamp: number; attachment?: Attachment };
 export type Conversation = { id: string; title: string; kind: "direct" | "group"; preview?: string; timestamp?: number; unread: number };
 export type Device = { id: string; state: "active" | "dormant" | "revoked"; current: boolean; last_activity?: number };
 export type Route = { server: string; revision: number; relay_fingerprint: string; tls_spki_fingerprint: string };

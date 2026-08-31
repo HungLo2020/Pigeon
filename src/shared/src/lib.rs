@@ -1,4 +1,8 @@
 use anyhow::Result;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hpke::{
     aead::AesGcm128, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
@@ -248,11 +252,178 @@ pub struct MlsRecord {
     pub target_devices: Vec<[u8; 32]>,
     pub payload: Vec<u8>,
 }
+
+/// Attachment wire format. Attachments are independently encrypted before a
+/// relay receives them.  The relay sees this record and ciphertext only; the
+/// corresponding `AttachmentDescriptor` (including the random content key)
+/// is sent inside the MLS application message that references `attachment_id`.
+pub const ATTACHMENT_VERSION: u8 = 1;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AttachmentDescriptor {
+    pub version: u8,
+    pub attachment_id: [u8; 32],
+    /// Stable MLS group id, bound into the authenticated ciphertext AAD.
+    pub conversation_id: Vec<u8>,
+    pub plaintext_size: u64,
+    pub plaintext_hash: [u8; 32],
+    pub ciphertext_hash: [u8; 32],
+    /// Fresh CSPRNG key. This descriptor is MLS application plaintext and is
+    /// never placed in a relay request, local index, or contact card.
+    pub content_key: [u8; 32],
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AttachmentPlaintext {
+    pub version: u8,
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Opaque relay object. The relay is allowed to index identity/device delivery
+/// metadata but cannot derive a content key, filename, MIME type, or plaintext.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AttachmentRecord {
+    pub version: u8,
+    pub recipient: AccountIdentity,
+    pub sender: AccountIdentity,
+    pub sender_device: [u8; 32],
+    pub target_devices: Vec<[u8; 32]>,
+    pub attachment_id: [u8; 32],
+    pub conversation_id: Vec<u8>,
+    pub plaintext_size: u64,
+    pub ciphertext_hash: [u8; 32],
+    pub nonce: [u8; 24],
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct EncryptedAttachment {
+    pub descriptor: AttachmentDescriptor,
+    pub nonce: [u8; 24],
+    pub ciphertext: Vec<u8>,
+}
+
+fn attachment_aad(attachment_id: &[u8; 32], conversation_id: &[u8]) -> Vec<u8> {
+    bincode::serialize(&(b"pigeon-attachment-v1\\0", attachment_id, conversation_id))
+        .expect("serializable attachment AAD")
+}
+
+fn valid_attachment_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename != "."
+        && filename != ".."
+        && !filename.contains(['/', '\\', '\0'])
+        && !filename.chars().any(char::is_control)
+        && filename.chars().count() <= 255
+}
+
+fn valid_attachment_mime_type(mime_type: &str) -> bool {
+    !mime_type.is_empty()
+        && mime_type.chars().count() <= 255
+        && !mime_type.chars().any(char::is_control)
+}
+
+pub fn encrypt_attachment(
+    attachment_id: [u8; 32],
+    conversation_id: Vec<u8>,
+    content_key: [u8; 32],
+    nonce: [u8; 24],
+    filename: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> Result<EncryptedAttachment> {
+    if attachment_id == [0; 32]
+        || content_key == [0; 32]
+        || nonce == [0; 24]
+        || conversation_id.is_empty()
+        || !valid_attachment_filename(&filename)
+        || !valid_attachment_mime_type(&mime_type)
+    {
+        anyhow::bail!("malformed attachment metadata")
+    }
+    let plaintext = AttachmentPlaintext {
+        version: ATTACHMENT_VERSION,
+        filename,
+        mime_type,
+        bytes,
+    };
+    let encoded = bincode::serialize(&plaintext)?;
+    let ciphertext = XChaCha20Poly1305::new((&content_key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &encoded,
+                aad: &attachment_aad(&attachment_id, &conversation_id),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("attachment encryption failed"))?;
+    Ok(EncryptedAttachment {
+        descriptor: AttachmentDescriptor {
+            version: ATTACHMENT_VERSION,
+            attachment_id,
+            conversation_id,
+            plaintext_size: plaintext.bytes.len() as u64,
+            plaintext_hash: Sha256::digest(&plaintext.bytes).into(),
+            ciphertext_hash: Sha256::digest(&ciphertext).into(),
+            content_key,
+        },
+        nonce,
+        ciphertext,
+    })
+}
+
+pub fn decrypt_attachment(
+    descriptor: &AttachmentDescriptor,
+    nonce: [u8; 24],
+    ciphertext: &[u8],
+) -> Result<AttachmentPlaintext> {
+    if descriptor.version != ATTACHMENT_VERSION
+        || descriptor.attachment_id == [0; 32]
+        || descriptor.content_key == [0; 32]
+        || descriptor.conversation_id.is_empty()
+        || descriptor.ciphertext_hash != <[u8; 32]>::from(Sha256::digest(ciphertext))
+    {
+        anyhow::bail!("invalid attachment descriptor or ciphertext")
+    }
+    let plaintext = XChaCha20Poly1305::new((&descriptor.content_key).into())
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &attachment_aad(&descriptor.attachment_id, &descriptor.conversation_id),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("attachment ciphertext authentication failed"))?;
+    let decoded: AttachmentPlaintext = bincode::deserialize(&plaintext)
+        .map_err(|_| anyhow::anyhow!("malformed attachment plaintext"))?;
+    if decoded.version != ATTACHMENT_VERSION
+        || !valid_attachment_filename(&decoded.filename)
+        || !valid_attachment_mime_type(&decoded.mime_type)
+        || decoded.bytes.len() as u64 != descriptor.plaintext_size
+        || descriptor.plaintext_hash != <[u8; 32]>::from(Sha256::digest(&decoded.bytes))
+    {
+        anyhow::bail!("attachment integrity metadata mismatch")
+    }
+    Ok(decoded)
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct RelayForward {
     pub version: u8,
     pub route: RoutingRecord,
     pub record: MlsRecord,
+    pub sender_relay: [u8; 32],
+    pub signature: Vec<u8>,
+}
+/// Authenticated relay-to-relay wrapper for an opaque attachment. Relay
+/// signatures authenticate transport only; they do not authorize the MLS key
+/// or attachment descriptor.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct RelayAttachmentForward {
+    pub version: u8,
+    pub route: RoutingRecord,
+    pub record: AttachmentRecord,
     pub sender_relay: [u8; 32],
     pub signature: Vec<u8>,
 }
@@ -539,6 +710,24 @@ pub enum Request {
         session_id: [u8; 16],
         capability: [u8; 32],
     },
+    /// Version-1 attachment variants are deliberately appended so existing
+    /// bincode request discriminants retain their wire values.
+    SendAttachment(AttachmentRecord),
+    FetchAttachment {
+        account: AccountIdentity,
+        device_id: [u8; 32],
+        attachment_id: [u8; 32],
+    },
+    AcknowledgeAttachment {
+        account: AccountIdentity,
+        device_id: [u8; 32],
+        attachment_id: [u8; 32],
+    },
+    QueueForwardAttachment {
+        record: AttachmentRecord,
+        route: RoutingRecord,
+    },
+    ForwardAttachment(RelayAttachmentForward),
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
@@ -556,6 +745,8 @@ pub enum Response {
     PairingCancelled,
     PairingExpired,
     PairingUnauthorized,
+    /// Appended to preserve existing response discriminants.
+    Attachment(Box<Option<AttachmentRecord>>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -837,6 +1028,44 @@ pub fn verify_relay_forward(forward: &RelayForward) -> Result<()> {
     }
     VerifyingKey::from_bytes(&forward.sender_relay)?
         .verify(&forward_bytes(forward), &signature(&forward.signature)?)
+        .map_err(Into::into)
+}
+fn attachment_forward_bytes(forward: &RelayAttachmentForward) -> Vec<u8> {
+    bincode::serialize(&(
+        forward.version,
+        &forward.route,
+        &forward.record,
+        forward.sender_relay,
+    ))
+    .expect("serializable attachment relay forward")
+}
+pub fn make_relay_attachment_forward(
+    relay: &SigningKey,
+    route: RoutingRecord,
+    record: AttachmentRecord,
+) -> RelayAttachmentForward {
+    let mut forward = RelayAttachmentForward {
+        version: 1,
+        route,
+        record,
+        sender_relay: relay.verifying_key().to_bytes(),
+        signature: vec![0; 64],
+    };
+    forward.signature = relay
+        .sign(&attachment_forward_bytes(&forward))
+        .to_bytes()
+        .to_vec();
+    forward
+}
+pub fn verify_relay_attachment_forward(forward: &RelayAttachmentForward) -> Result<()> {
+    if forward.version != 1 {
+        anyhow::bail!("unsupported attachment relay forwarding version")
+    }
+    VerifyingKey::from_bytes(&forward.sender_relay)?
+        .verify(
+            &attachment_forward_bytes(forward),
+            &signature(&forward.signature)?,
+        )
         .map_err(Into::into)
 }
 pub fn make_routing(
@@ -1456,5 +1685,69 @@ mod tests {
             AccountTransitionKind::DeviceAndRecovery,
         );
         assert!(self_approved.is_err());
+    }
+
+    #[test]
+    fn attachment_round_trip_binds_ciphertext_and_mls_group() {
+        let encrypted = encrypt_attachment(
+            [1; 32],
+            b"mls-group".to_vec(),
+            [2; 32],
+            [3; 24],
+            "photo.png".into(),
+            "image/png".into(),
+            b"private image bytes".to_vec(),
+        )
+        .unwrap();
+        let plain = decrypt_attachment(
+            &encrypted.descriptor,
+            encrypted.nonce,
+            &encrypted.ciphertext,
+        )
+        .unwrap();
+        assert_eq!(plain.filename, "photo.png");
+        assert_eq!(plain.bytes, b"private image bytes");
+        let mut tampered = encrypted.ciphertext.clone();
+        tampered[0] ^= 1;
+        assert!(decrypt_attachment(&encrypted.descriptor, encrypted.nonce, &tampered).is_err());
+        assert!(decrypt_attachment(
+            &encrypted.descriptor,
+            encrypted.nonce,
+            &encrypted.ciphertext[..encrypted.ciphertext.len() - 1],
+        )
+        .is_err());
+        let mut wrong_group = encrypted.descriptor.clone();
+        wrong_group.conversation_id = b"other-group".to_vec();
+        assert!(decrypt_attachment(&wrong_group, encrypted.nonce, &encrypted.ciphertext).is_err());
+        let mut wrong_key = encrypted.descriptor.clone();
+        wrong_key.content_key = [7; 32];
+        assert!(decrypt_attachment(&wrong_key, encrypted.nonce, &encrypted.ciphertext).is_err());
+        let mut unsupported = encrypted.descriptor.clone();
+        unsupported.version = ATTACHMENT_VERSION + 1;
+        assert!(decrypt_attachment(&unsupported, encrypted.nonce, &encrypted.ciphertext).is_err());
+    }
+
+    #[test]
+    fn attachment_rejects_unsafe_metadata() {
+        assert!(encrypt_attachment(
+            [1; 32],
+            b"group".to_vec(),
+            [2; 32],
+            [3; 24],
+            "../escape".into(),
+            "application/octet-stream".into(),
+            vec![1]
+        )
+        .is_err());
+        assert!(encrypt_attachment(
+            [1; 32],
+            b"group".to_vec(),
+            [2; 32],
+            [3; 24],
+            "..".into(),
+            "image/png\nforged".into(),
+            vec![1]
+        )
+        .is_err());
     }
 }

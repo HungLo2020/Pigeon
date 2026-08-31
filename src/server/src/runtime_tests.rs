@@ -2,8 +2,8 @@ use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use pigeon_shared::{
     account_id, account_identity, make_authorized_device_set, make_card_from_roster,
-    make_relay_forward, AccountTransitionKind, DeviceRecord, MlsRecord, PairingArtifactKind,
-    PairingRelayArtifact, PigeonAccountGenesis,
+    make_relay_forward, AccountTransitionKind, AttachmentRecord, DeviceRecord, MlsRecord,
+    PairingArtifactKind, PairingRelayArtifact, PigeonAccountGenesis,
 };
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
@@ -760,6 +760,161 @@ fn fetch_pairs_sql_id_with_decoded_mls_record() {
     assert_eq!(records.len(), 1);
     assert!(records[0].0 > 0);
     assert_eq!(records[0].1.payload, record.payload);
+}
+
+#[test]
+fn opaque_attachment_delivery_requires_per_device_ack_and_preserves_bytes() {
+    let database = Connection::open_in_memory().unwrap();
+    initialize(&database).unwrap();
+    let root = SigningKey::generate(&mut OsRng);
+    let device_key = SigningKey::generate(&mut OsRng);
+    let encryption = StaticSecret::random_from_rng(OsRng);
+    let device = make_device(&root, &device_key, vec![1]);
+    let card = make_card(&root, &encryption, "server.test".into(), device.clone());
+    assert!(matches!(
+        process(
+            &database,
+            Request::Register {
+                card: card.clone(),
+                device: device.clone(),
+                device_signature: vec![]
+            }
+        ),
+        Response::Ok
+    ));
+    let record = AttachmentRecord {
+        version: pigeon_shared::ATTACHMENT_VERSION,
+        recipient: account_for(&card),
+        sender: account_for(&card),
+        sender_device: device.device_id,
+        target_devices: vec![device.device_id],
+        attachment_id: [4; 32],
+        conversation_id: b"group".to_vec(),
+        plaintext_size: 3,
+        ciphertext_hash: Sha256::digest([7, 8, 9]).into(),
+        nonce: [5; 24],
+        ciphertext: vec![7, 8, 9],
+    };
+    assert!(matches!(
+        process(&database, Request::SendAttachment(record.clone())),
+        Response::Ok
+    ));
+    // A retry is idempotent, but an attacker cannot reuse the identifier to
+    // replace opaque bytes after another target has seen the MLS descriptor.
+    assert!(matches!(
+        process(&database, Request::SendAttachment(record.clone())),
+        Response::Ok
+    ));
+    let mut substituted = record.clone();
+    substituted.ciphertext = vec![1, 2, 3];
+    substituted.ciphertext_hash = Sha256::digest(&substituted.ciphertext).into();
+    assert!(matches!(
+        process(&database, Request::SendAttachment(substituted)),
+        Response::Error(_)
+    ));
+    let Response::Attachment(fetched) = process(
+        &database,
+        Request::FetchAttachment {
+            account: account_for(&card),
+            device_id: device.device_id,
+            attachment_id: [4; 32],
+        },
+    ) else {
+        panic!("expected attachment")
+    };
+    let Some(fetched) = *fetched else {
+        panic!("expected attachment")
+    };
+    assert_eq!(fetched.ciphertext, record.ciphertext);
+    assert!(matches!(
+        process(
+            &database,
+            Request::AcknowledgeAttachment {
+                account: account_for(&card),
+                device_id: device.device_id,
+                attachment_id: [4; 32]
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        process(
+            &database,
+            Request::FetchAttachment {
+                account: account_for(&card),
+                device_id: device.device_id,
+                attachment_id: [4; 32]
+            },
+        ),
+        Response::Attachment(value) if value.is_none()
+    ));
+}
+
+#[test]
+fn opaque_attachment_expires_at_the_hard_retention_bound() {
+    let database = Connection::open_in_memory().unwrap();
+    initialize(&database).unwrap();
+    let root = SigningKey::generate(&mut OsRng);
+    let device_key = SigningKey::generate(&mut OsRng);
+    let encryption = StaticSecret::random_from_rng(OsRng);
+    let device = make_device(&root, &device_key, vec![1]);
+    let card = make_card(&root, &encryption, "server.test".into(), device.clone());
+    let start = 50_000_i64;
+    assert!(matches!(
+        process_at(
+            &database,
+            Request::Register {
+                card: card.clone(),
+                device: device.clone(),
+                device_signature: vec![]
+            },
+            start,
+        ),
+        Response::Ok
+    ));
+    let record = AttachmentRecord {
+        version: pigeon_shared::ATTACHMENT_VERSION,
+        recipient: account_for(&card),
+        sender: account_for(&card),
+        sender_device: device.device_id,
+        target_devices: vec![device.device_id],
+        attachment_id: [9; 32],
+        conversation_id: b"retention-group".to_vec(),
+        plaintext_size: 4,
+        ciphertext_hash: Sha256::digest([1, 2, 3, 4]).into(),
+        nonce: [7; 24],
+        ciphertext: vec![1, 2, 3, 4],
+    };
+    assert!(matches!(
+        process_at(&database, Request::SendAttachment(record), start),
+        Response::Ok
+    ));
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM attachments_v1", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    // Lifecycle cleanup is driven by ordinary relay requests; it must not
+    // retain unacknowledged opaque bytes past the documented 14-day bound.
+    assert!(matches!(
+        process_at(
+            &database,
+            Request::GetRevocations {
+                account: account_for(&card)
+            },
+            start + RETENTION_SECONDS,
+        ),
+        Response::Revocations(_)
+    ));
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM attachments_v1", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

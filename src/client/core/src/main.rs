@@ -17,10 +17,10 @@ use pigeon_shared::{
     make_authorized_device_set, make_card_from_roster, make_device, make_pairing_approval,
     make_revocation, make_routing, open_bootstrap, roster_hash, seal_bootstrap, verify_device_set,
     verify_pairing_approval, verify_pairing_request, verify_roster_transition,
-    AccountTransitionKind, AuthorizedDeviceSet, BootstrapPayload, ContactCard, DeviceRecord,
-    DeviceRevocation, EncryptedBootstrap, PairingApproval, PairingArtifactKind,
-    PairingRelayArtifact, PairingRequest, PigeonAccountGenesis, RelayDescriptor, Request, Response,
-    RoutingRecord,
+    AccountTransitionKind, AttachmentDescriptor, AuthorizedDeviceSet, BootstrapPayload,
+    ContactCard, DeviceRecord, DeviceRevocation, EncryptedBootstrap, PairingApproval,
+    PairingArtifactKind, PairingRelayArtifact, PairingRequest, PigeonAccountGenesis,
+    RelayDescriptor, Request, Response, RoutingRecord,
 };
 use rand_core::{OsRng, RngCore};
 use rustls::{
@@ -44,7 +44,10 @@ mod messaging;
 mod routing;
 mod storage;
 use history::message_time;
-use messaging::{unwrap_mls_payload, wrap_mls_payload};
+use messaging::{
+    decode_application, encode_application, unwrap_mls_payload, wrap_mls_payload,
+    ApplicationContent,
+};
 use routing::should_replace_route;
 use storage::{load, save};
 
@@ -90,6 +93,10 @@ struct State {
     /// applies equally to CLI and GUI sync.
     #[serde(default)]
     read_at: HashMap<String, i64>,
+    /// Metadata and private cache paths only. Portable account backups
+    /// intentionally exclude this collection and never carry decrypted bytes.
+    #[serde(default)]
+    attachments: HashMap<String, LocalAttachment>,
 }
 const ACCOUNT_STATE_VERSION: u8 = 3;
 const RECOVERY_WRAP_VERSION: u8 = 1;
@@ -184,6 +191,17 @@ struct LocalMessage {
     sender: String,
     text: String,
     timestamp: i64,
+    #[serde(default)]
+    attachment: Option<AttachmentDescriptor>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LocalAttachment {
+    descriptor: AttachmentDescriptor,
+    filename: String,
+    mime_type: String,
+    local_path: String,
+    complete: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct GroupState {
@@ -336,6 +354,13 @@ enum Command {
         to: String,
         text: String,
     },
+    /// Encrypt and send a file through the current MLS conversation.
+    SendAttachment {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        file: String,
+    },
     GroupCreate {
         #[arg(long)]
         group: String,
@@ -346,6 +371,19 @@ enum Command {
         #[arg(long)]
         group: String,
         text: String,
+    },
+    GroupAttachment {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        file: String,
+    },
+    /// Explicitly copy a verified attachment to a user-selected local path.
+    SaveAttachment {
+        #[arg(long)]
+        attachment_id: String,
+        #[arg(long)]
+        output: String,
     },
     GroupAdd {
         #[arg(long)]
@@ -807,6 +845,82 @@ fn delivery_request(
         bail!("invalid cross-server contact route")
     }
     Ok(Request::QueueForward { record, route })
+}
+fn attachment_delivery_request(
+    state: &State,
+    recipient: &ContactCard,
+    record: pigeon_shared::AttachmentRecord,
+) -> Result<Request> {
+    if recipient.server == state.card.server {
+        return Ok(Request::SendAttachment(record));
+    }
+    let route = state
+        .cached_routes
+        .get(&contact_key(recipient)?)
+        .context("cross-server contact has no verified relay-bound route")?
+        .clone();
+    pigeon_shared::verify_routing(&route)?;
+    if route.identity != identity_id(recipient)
+        || route.genesis != recipient.genesis
+        || route.server == state.card.server
+    {
+        bail!("invalid cross-server attachment route")
+    }
+    Ok(Request::QueueForwardAttachment { record, route })
+}
+
+async fn upload_attachment_to_contact(
+    state: &State,
+    certificate: &str,
+    contact: &ContactCard,
+    encrypted: &pigeon_shared::EncryptedAttachment,
+) -> Result<()> {
+    let request_value = attachment_delivery_request(
+        state,
+        contact,
+        pigeon_shared::AttachmentRecord {
+            version: pigeon_shared::ATTACHMENT_VERSION,
+            recipient: account_identity(contact.genesis.clone())?,
+            sender: account_identity(state.card.genesis.clone())?,
+            sender_device: state.device.device_id,
+            target_devices: contact
+                .devices
+                .iter()
+                .map(|device| device.device_id)
+                .collect(),
+            attachment_id: encrypted.descriptor.attachment_id,
+            conversation_id: encrypted.descriptor.conversation_id.clone(),
+            plaintext_size: encrypted.descriptor.plaintext_size,
+            ciphertext_hash: encrypted.descriptor.ciphertext_hash,
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext.clone(),
+        },
+    )?;
+    response_ok(match state.routing.as_ref() {
+        Some(route) => pinned_request(route, request_value).await?,
+        None => request(&state.card.server, certificate, request_value).await?,
+    })
+}
+
+async fn upload_attachment_to_group(
+    state: &State,
+    certificate: &str,
+    members: &[pigeon_shared::AccountIdentity],
+    encrypted: &pigeon_shared::EncryptedAttachment,
+) -> Result<()> {
+    for member in members {
+        if member.genesis == state.card.genesis {
+            continue;
+        }
+        let contact = state
+            .contacts
+            .iter()
+            .find(|contact| contact.genesis == member.genesis)
+            .cloned()
+            .context("attachment recipient is not a verified canonical contact")?;
+        upload_attachment_to_contact(state, certificate, &contact, encrypted).await?;
+    }
+    Ok(())
 }
 fn parse_identity(value: &str) -> Result<[u8; 32]> {
     hex::decode(value)?

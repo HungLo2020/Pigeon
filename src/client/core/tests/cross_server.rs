@@ -424,6 +424,48 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
     )
     .contains("before restart"));
 
+    // The opaque file is queued from Alice's own relay to Bob's relay, while
+    // the only usable content key travels in the MLS application event.
+    let attachment = directory.join("notes.txt");
+    fs::write(&attachment, b"opaque relay attachment test\n").unwrap();
+    run(
+        &client_bin,
+        &[
+            "--state".into(),
+            alice.display().to_string(),
+            "--certificate".into(),
+            directory.join("a.der").display().to_string(),
+            "send-attachment".into(),
+            "--to".into(),
+            bob_id.clone(),
+            "--file".into(),
+            attachment.display().to_string(),
+        ],
+    );
+    thread::sleep(Duration::from_millis(700));
+    run(
+        &client_bin,
+        &[
+            "--state".into(),
+            bob.display().to_string(),
+            "--certificate".into(),
+            directory.join("b.der").display().to_string(),
+            "fetch".into(),
+        ],
+    );
+    let bob_state: serde_json::Value = serde_json::from_slice(&fs::read(&bob).unwrap()).unwrap();
+    let local = bob_state["attachments"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(local["filename"], "notes.txt");
+    assert_eq!(
+        fs::read(local["local_path"].as_str().unwrap()).unwrap(),
+        b"opaque relay attachment test\n"
+    );
+
     // State and relay identities are file-backed; restarting both sides must
     // preserve the established MLS group and recipient ACK state.
     relay_a.kill().unwrap();
@@ -729,6 +771,42 @@ fn ownerless_group_membership_and_messages_cross_three_relays() {
         &client_args(&bob, &directory.join("b.der"), vec!["fetch".into()])
     )
     .contains("carol-to-all"));
+    // An image-shaped byte stream uses the exact same encrypted attachment
+    // protocol in a three-relay ownerless group; image presentation is purely
+    // a local GUI concern after decryption.
+    let image = directory.join("sample.png");
+    fs::write(
+        &image,
+        b"\x89PNG\r\n\x1a\nnot-a-real-image-but-opaque-bytes",
+    )
+    .unwrap();
+    run(
+        &client_bin,
+        &client_args(
+            &carol,
+            &directory.join("c.der"),
+            vec![
+                "group-attachment".into(),
+                "--group".into(),
+                group.clone(),
+                "--file".into(),
+                image.display().to_string(),
+            ],
+        ),
+    );
+    thread::sleep(Duration::from_millis(700));
+    for (state, certificate) in [(&alice, "a.der"), (&bob, "b.der")] {
+        run(
+            &client_bin,
+            &client_args(state, &directory.join(certificate), vec!["fetch".into()]),
+        );
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+        assert!(state["attachments"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|entry| entry["filename"] == "sample.png"));
+    }
     // Restart a current participant and its relay, then remove Bob as another
     // ordinary participant. The removal commit targets survivors only.
     relay_a.kill().unwrap();

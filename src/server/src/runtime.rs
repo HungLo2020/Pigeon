@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "lifecycle.rs"]
@@ -9,7 +10,7 @@ mod relay;
 mod schema;
 pub(crate) use lifecycle::maintain_lifecycle;
 pub(crate) use lifecycle::system_now;
-use lifecycle::touch_device;
+use lifecycle::{remove_completed_attachments, touch_device};
 pub(crate) use relay::{bind_relay_tls_spki, set_relay_address};
 use relay::{relay_address, relay_identity, relay_signer, relay_tls_spki};
 pub(crate) use schema::initialize;
@@ -211,6 +212,123 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                     )?;
                 }
                 transaction.commit()?;
+                Ok(Response::Ok)
+            }
+            Request::SendAttachment(mut record) => {
+                if record.version != pigeon_shared::ATTACHMENT_VERSION
+                    || record.attachment_id == [0; 32]
+                    || record.conversation_id.is_empty()
+                    || record.ciphertext.is_empty()
+                    || record.ciphertext_hash
+                        != <[u8; 32]>::from(sha2::Sha256::digest(&record.ciphertext))
+                {
+                    bail!("malformed opaque attachment record")
+                }
+                let sender_genesis = account_key(&record.sender)?;
+                let sender_registered: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices_v2 WHERE genesis = ?1 AND device_id = ?2 AND revoked = 0)",
+                    params![sender_genesis.clone(), record.sender_device.to_vec()],
+                    |row| row.get(0),
+                )?;
+                if sender_registered
+                    && !touch_device(connection, &sender_genesis, record.sender_device, now)?
+                {
+                    bail!("attachment sender device is not authorized")
+                }
+                let recipient_genesis = account_key(&record.recipient)?;
+                let found: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM identities_v2 WHERE genesis = ?1)",
+                    params![recipient_genesis.clone()],
+                    |row| row.get(0),
+                )?;
+                if !found {
+                    bail!("attachment recipient has not registered this server")
+                }
+                record.target_devices.retain(|device| connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices_v2 WHERE device_id = ?1 AND genesis = ?2 AND revoked = 0 AND dormant = 0)",
+                    params![device.to_vec(), recipient_genesis.clone()],
+                    |row| row.get::<_, bool>(0),
+                ).unwrap_or(false));
+                if record.target_devices.is_empty() {
+                    return Ok(Response::Ok);
+                }
+                let mut targets = std::collections::HashSet::new();
+                if !record
+                    .target_devices
+                    .iter()
+                    .all(|device| targets.insert(*device))
+                {
+                    bail!("attachment record has duplicate delivery targets")
+                }
+                let transaction = connection.unchecked_transaction()?;
+                let existing: Option<Vec<u8>> = transaction.query_row(
+                    "SELECT record FROM attachments_v1 WHERE recipient_genesis=?1 AND attachment_id=?2",
+                    params![recipient_genesis.clone(), record.attachment_id.to_vec()],
+                    |row| row.get(0),
+                ).optional()?;
+                if let Some(existing) = existing {
+                    if existing != encode(&record)? {
+                        bail!("attachment id already exists with different ciphertext")
+                    }
+                    return Ok(Response::Ok);
+                }
+                transaction.execute(
+                    "INSERT INTO attachments_v1 (recipient_genesis, attachment_id, record, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![recipient_genesis.clone(), record.attachment_id.to_vec(), encode(&record)?, now],
+                )?;
+                for device in &record.target_devices {
+                    transaction.execute(
+                        "INSERT INTO attachment_deliveries_v1 (recipient_genesis, attachment_id, device_id) VALUES (?1, ?2, ?3)",
+                        params![recipient_genesis.clone(), record.attachment_id.to_vec(), device.to_vec()],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(Response::Ok)
+            }
+            Request::FetchAttachment {
+                account,
+                device_id,
+                attachment_id,
+            } => {
+                let genesis = account_key(&account)?;
+                let authorized: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices_v2 WHERE genesis=?1 AND device_id=?2 AND revoked=0)",
+                    params![genesis.clone(), device_id.to_vec()],
+                    |row| row.get(0),
+                )?;
+                if !authorized {
+                    bail!("device is not authorized for attachment delivery")
+                }
+                touch_device(connection, &genesis, device_id, now)?;
+                let bytes: Option<Vec<u8>> = connection.query_row(
+                    "SELECT a.record FROM attachments_v1 a JOIN attachment_deliveries_v1 d ON d.recipient_genesis=a.recipient_genesis AND d.attachment_id=a.attachment_id WHERE a.recipient_genesis=?1 AND a.attachment_id=?2 AND d.device_id=?3 AND d.acknowledged=0",
+                    params![genesis, attachment_id.to_vec(), device_id.to_vec()],
+                    |row| row.get(0),
+                ).optional()?;
+                Ok(Response::Attachment(Box::new(
+                    bytes.map(|bytes| decode(&bytes)).transpose()?,
+                )))
+            }
+            Request::AcknowledgeAttachment {
+                account,
+                device_id,
+                attachment_id,
+            } => {
+                let genesis = account_key(&account)?;
+                let authorized: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices_v2 WHERE genesis=?1 AND device_id=?2 AND revoked=0)",
+                    params![genesis.clone(), device_id.to_vec()],
+                    |row| row.get(0),
+                )?;
+                if !authorized {
+                    bail!("device is not authorized for attachment acknowledgement")
+                }
+                touch_device(connection, &genesis, device_id, now)?;
+                connection.execute(
+                    "UPDATE attachment_deliveries_v1 SET acknowledged=1 WHERE recipient_genesis=?1 AND attachment_id=?2 AND device_id=?3",
+                    params![genesis, attachment_id.to_vec(), device_id.to_vec()],
+                )?;
+                remove_completed_attachments(connection)?;
                 Ok(Response::Ok)
             }
             Request::Fetch {
@@ -526,6 +644,24 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                 )?;
                 Ok(Response::Ok)
             }
+            Request::QueueForwardAttachment { record, route } => {
+                verify_routing(&route)?;
+                if record.recipient.compact_id != route.identity
+                    || record.recipient.genesis != route.genesis
+                {
+                    bail!("attachment forward route identity does not match recipient")
+                }
+                let forward = pigeon_shared::make_relay_attachment_forward(
+                    &relay_signer(connection)?,
+                    route,
+                    record,
+                );
+                connection.execute(
+                    "INSERT INTO outbound_attachment_forwards (forward) VALUES (?1)",
+                    params![encode(&forward)?],
+                )?;
+                Ok(Response::Ok)
+            }
             Request::ForwardMls(forward) => {
                 verify_relay_forward(&forward)?;
                 verify_routing(&forward.route)?;
@@ -559,6 +695,39 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                 Ok(process_at(
                     connection,
                     Request::SendMls(forward.record),
+                    now,
+                ))
+            }
+            Request::ForwardAttachment(forward) => {
+                pigeon_shared::verify_relay_attachment_forward(&forward)?;
+                verify_routing(&forward.route)?;
+                if forward.record.recipient.compact_id != forward.route.identity
+                    || forward.record.recipient.genesis != forward.route.genesis
+                {
+                    bail!("attachment forward route identity does not match recipient")
+                }
+                if let Some(current) = connection
+                    .query_row(
+                        "SELECT route FROM routes_v2 WHERE genesis = ?1",
+                        params![genesis_key(&forward.route.genesis)?],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?
+                {
+                    let current: RoutingRecord = decode(&current)?;
+                    if current.revision > forward.route.revision {
+                        return Ok(Response::Moved(current));
+                    }
+                }
+                if forward.route.relay_identity != relay_identity(connection)?
+                    || forward.route.tls_spki_fingerprint != relay_tls_spki(connection)?
+                    || forward.route.server != relay_address(connection)?
+                {
+                    bail!("attachment route does not name this relay")
+                }
+                Ok(process_at(
+                    connection,
+                    Request::SendAttachment(forward.record),
                     now,
                 ))
             }
@@ -665,6 +834,60 @@ pub(super) async fn flush_network_outbound(database: Arc<Mutex<Connection>>) -> 
         }
         Ok(Response::Error(error)) => bail!("destination rejected forward: {error}"),
         Ok(_) => bail!("unexpected destination forwarding response"),
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+pub(super) async fn flush_network_attachment_outbound(
+    database: Arc<Mutex<Connection>>,
+) -> Result<()> {
+    let candidate = {
+        let connection = database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        connection
+            .query_row(
+                "SELECT id, forward FROM outbound_attachment_forwards ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+    };
+    let Some((id, bytes)) = candidate else {
+        return Ok(());
+    };
+    let mut forward: pigeon_shared::RelayAttachmentForward = decode(&bytes)?;
+    let response = relay_request(&forward.route, Request::ForwardAttachment(forward.clone())).await;
+    let connection = database
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+    match response {
+        Ok(Response::Ok) => {
+            connection.execute(
+                "DELETE FROM outbound_attachment_forwards WHERE id=?1",
+                params![id],
+            )?;
+        }
+        Ok(Response::Moved(route)) => {
+            verify_routing(&route)?;
+            if route.identity != forward.record.recipient.compact_id
+                || route.genesis != forward.record.recipient.genesis
+            {
+                bail!("attachment MOVED identity mismatch")
+            }
+            forward = pigeon_shared::make_relay_attachment_forward(
+                &relay_signer(&connection)?,
+                route,
+                forward.record,
+            );
+            connection.execute(
+                "UPDATE outbound_attachment_forwards SET forward=?1 WHERE id=?2",
+                params![encode(&forward)?, id],
+            )?;
+        }
+        Ok(Response::Error(error)) => bail!("destination rejected attachment forward: {error}"),
+        Ok(_) => bail!("unexpected attachment forwarding response"),
         Err(error) => return Err(error),
     }
     Ok(())

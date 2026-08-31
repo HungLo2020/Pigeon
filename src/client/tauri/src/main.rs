@@ -2,7 +2,10 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs,
     io::{BufRead, BufReader},
+    path::Path,
+    process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -73,6 +76,16 @@ struct Message {
     sender: String,
     text: String,
     timestamp: i64,
+    attachment: Option<AttachmentSummary>,
+}
+#[derive(Serialize, Clone)]
+struct AttachmentSummary {
+    id: String,
+    filename: String,
+    mime_type: String,
+    size: u64,
+    complete: bool,
+    state: String,
 }
 #[derive(Serialize, Clone)]
 struct AccountStatus {
@@ -268,11 +281,38 @@ fn account_status(app: tauri::AppHandle) -> Result<AccountStatus, String> {
         .into_iter()
         .flatten()
         .filter_map(|message| {
+            let attachment = message.get("attachment").and_then(|descriptor| {
+                let id = hex_bytes(descriptor.get("attachment_id"));
+                let local = value
+                    .get("attachments")
+                    .and_then(|entries| entries.get(&id));
+                let complete = local
+                    .and_then(|entry| entry.get("complete"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some(AttachmentSummary {
+                    id,
+                    filename: local
+                        .and_then(|entry| entry.get("filename"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Attachment")
+                        .to_owned(),
+                    mime_type: local
+                        .and_then(|entry| entry.get("mime_type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("application/octet-stream")
+                        .to_owned(),
+                    size: descriptor.get("plaintext_size")?.as_u64()?,
+                    complete,
+                    state: if complete { "available" } else { "pending" }.into(),
+                })
+            });
             Some(Message {
                 conversation: message.get("conversation")?.as_str()?.to_owned(),
                 sender: message.get("sender")?.as_str()?.to_owned(),
                 text: message.get("text")?.as_str()?.to_owned(),
                 timestamp: message.get("timestamp")?.as_i64()?,
+                attachment,
             })
         })
         .collect();
@@ -753,6 +793,134 @@ fn send_group(app: tauri::AppHandle, group: String, text: String) -> Result<(), 
     core(&app, &["group-send".into(), "--group".into(), group, text]).map(|_| ())
 }
 #[tauri::command]
+fn send_attachment(
+    app: tauri::AppHandle,
+    conversation: String,
+    file: String,
+) -> Result<(), String> {
+    if conversation.starts_with("group:") {
+        core(
+            &app,
+            &[
+                "group-attachment".into(),
+                "--group".into(),
+                conversation.trim_start_matches("group:").into(),
+                "--file".into(),
+                file,
+            ],
+        )
+    } else {
+        core(
+            &app,
+            &[
+                "send-attachment".into(),
+                "--to".into(),
+                conversation,
+                "--file".into(),
+                file,
+            ],
+        )
+    }
+    .map(|_| ())
+}
+#[tauri::command]
+fn save_attachment(
+    app: tauri::AppHandle,
+    attachment_id: String,
+    output: String,
+) -> Result<(), String> {
+    core(
+        &app,
+        &[
+            "save-attachment".into(),
+            "--attachment-id".into(),
+            attachment_id,
+            "--output".into(),
+            output,
+        ],
+    )
+    .map(|_| ())
+}
+
+/// Return a deliberately bounded data URL only for a locally decrypted,
+/// explicitly requested image.  The daemon/core has already authenticated and
+/// stored this file; no relay bytes or attachment keys cross this UI boundary.
+#[tauri::command]
+fn attachment_preview(app: tauri::AppHandle, attachment_id: String) -> Result<String, String> {
+    let state = snapshot(&app)?
+        .get("state")
+        .cloned()
+        .ok_or("no selected account state")?;
+    let entry = state
+        .get("attachments")
+        .and_then(|entries| entries.get(&attachment_id))
+        .ok_or("attachment is not available locally")?;
+    let complete = entry
+        .get("complete")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mime = entry
+        .get("mime_type")
+        .and_then(|value| value.as_str())
+        .ok_or("attachment MIME type is missing")?;
+    if !complete
+        || !matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        )
+    {
+        return Err("only complete PNG, JPEG, GIF, and WebP attachments may be previewed".into());
+    }
+    let path = entry
+        .get("local_path")
+        .and_then(|value| value.as_str())
+        .ok_or("attachment cache path is missing")?;
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Err("image is too large for an inline preview; save it to view it".into());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+/// Opening is an explicit desktop-user action.  It is intentionally limited
+/// to a daemon-verified private cache path and never shells out through a
+/// filename supplied by a remote sender.
+#[tauri::command]
+fn open_attachment(app: tauri::AppHandle, attachment_id: String) -> Result<(), String> {
+    let state = snapshot(&app)?
+        .get("state")
+        .cloned()
+        .ok_or("no selected account state")?;
+    let path = state
+        .get("attachments")
+        .and_then(|entries| entries.get(&attachment_id))
+        .filter(|entry| entry.get("complete").and_then(|value| value.as_bool()) == Some(true))
+        .and_then(|entry| entry.get("local_path"))
+        .and_then(|value| value.as_str())
+        .ok_or("attachment is not available locally")?;
+    if !Path::new(path).is_file() {
+        return Err("attachment cache file is missing".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("could not open attachment: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err("opening attachments is not available on this platform yet; save it first".into())
+    }
+}
+#[tauri::command]
 fn import_contact(app: tauri::AppHandle, card: String) -> Result<(), String> {
     core(&app, &["add-contact".into(), card]).map(|_| ())
 }
@@ -836,6 +1004,10 @@ fn main() {
             fetch_messages,
             send_direct,
             send_group,
+            send_attachment,
+            save_attachment,
+            attachment_preview,
+            open_attachment,
             import_contact,
             share_card,
             mark_read,
@@ -857,18 +1029,21 @@ mod tests {
                 sender: "bob".into(),
                 text: "old".into(),
                 timestamp: 10,
+                attachment: None,
             },
             Message {
                 conversation: "bob".into(),
                 sender: "alice".into(),
                 text: "sent".into(),
                 timestamp: 20,
+                attachment: None,
             },
             Message {
                 conversation: "bob".into(),
                 sender: "bob".into(),
                 text: "new".into(),
                 timestamp: 30,
+                attachment: None,
             },
         ];
         assert_eq!(unread_count(&messages, Some("alice"), "bob", 10), 1);

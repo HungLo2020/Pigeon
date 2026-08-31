@@ -8,6 +8,10 @@ The Pigeon client is shared across supported desktop and mobile platforms.
 
 The client owns user keys, local long-term history, encryption/decryption, conversations, contacts, groups, retention settings, routing state, device-management actions, and call state.
 
+Attachments are encrypted locally with a fresh per-file key. The daemon owns
+their upload, download, verification, private cache, acknowledgement, and
+retry; UI hosts only submit paths and render typed completion state.
+
 Each authorized device synchronizes recent state independently with the user's current server when it connects. Normal synchronization must not depend on another user device being online.
 
 Clients must expose device-management controls that distinguish active, dormant, and revoked devices. A user may explicitly revoke a lost, stolen, retired, or unwanted device. A device inactive for more than 90 days becomes dormant rather than revoked and may become active again automatically when it reconnects with its still-valid credential.

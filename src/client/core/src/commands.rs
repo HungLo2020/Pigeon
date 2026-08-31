@@ -97,6 +97,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 groups: HashMap::new(),
                 history: vec![],
                 read_at: HashMap::new(),
+                attachments: HashMap::new(),
             };
             if server.is_empty() {
                 save(&args.state, &state)?;
@@ -304,6 +305,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 groups: backup.groups,
                 history: vec![],
                 read_at: HashMap::new(),
+                attachments: HashMap::new(),
             };
             if state.routing.is_some() || !state.card.server.trim().is_empty() {
                 response_ok(
@@ -623,6 +625,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 groups: HashMap::new(),
                 history: vec![],
                 read_at: HashMap::new(),
+                attachments: HashMap::new(),
             };
             response_ok(
                 account_request(
@@ -755,13 +758,19 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let group_id = if let Some(group_id) = state.mls_conversations.get(&conversation) {
                 GroupId::tls_deserialize_exact(group_id)?
             } else {
-                let recipient_device = recipient
+                let packages = recipient
                     .devices
-                    .first()
-                    .context("contact has no authorized device")?;
-                let package =
-                    KeyPackageIn::tls_deserialize_exact(recipient_device.mls_key_package.clone())?
-                        .validate(provider.crypto(), ProtocolVersion::Mls10)?;
+                    .iter()
+                    .map(|device| -> Result<_> {
+                        Ok(
+                            KeyPackageIn::tls_deserialize_exact(device.mls_key_package.clone())?
+                                .validate(provider.crypto(), ProtocolVersion::Mls10)?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if packages.is_empty() {
+                    bail!("contact has no authorized device")
+                }
                 let config = MlsGroupCreateConfig::builder()
                     .ciphersuite(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
                     .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
@@ -775,7 +784,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                     signature_key: signer.to_public_vec().into(),
                 };
                 let mut group = MlsGroup::new(&provider, &signer, &config, credential)?;
-                let (_, welcome, _) = group.add_members(&provider, &signer, &[package])?;
+                let (_, welcome, _) = group.add_members(&provider, &signer, &packages)?;
                 group.merge_pending_commit(&provider)?;
                 let id = group.group_id().clone();
                 response_ok(
@@ -847,9 +856,281 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 sender: canonical_account_key(&state.card.genesis)?,
                 text,
                 timestamp: message_time(),
+                attachment: None,
             });
             save(&args.state, &state)?;
             println!("sent");
+        }
+        Command::SendAttachment { to, file } => {
+            let mut state = load(&args.state)?;
+            let recipient = contact_for_selector(&state, &to)?;
+            let (provider, signer) = mls_runtime(&state)?;
+            let conversation = contact_key(&recipient)?;
+            let group_id = if let Some(existing) = state.mls_conversations.get(&conversation) {
+                GroupId::tls_deserialize_exact(existing)?
+            } else {
+                let packages = recipient
+                    .devices
+                    .iter()
+                    .map(|device| -> Result<_> {
+                        Ok(
+                            KeyPackageIn::tls_deserialize_exact(device.mls_key_package.clone())?
+                                .validate(provider.crypto(), ProtocolVersion::Mls10)?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if packages.is_empty() {
+                    bail!("contact has no authorized device")
+                }
+                let config = MlsGroupCreateConfig::builder()
+                    .ciphersuite(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
+                    .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                    .use_ratchet_tree_extension(true)
+                    .build();
+                let credential = CredentialWithKey {
+                    credential: BasicCredential::new(pigeon_shared::canonical_genesis_key(
+                        &state.card.genesis,
+                    )?)
+                    .into(),
+                    signature_key: signer.to_public_vec().into(),
+                };
+                let mut group = MlsGroup::new(&provider, &signer, &config, credential)?;
+                let (_, welcome, _) = group.add_members(&provider, &signer, &packages)?;
+                group.merge_pending_commit(&provider)?;
+                let id = group.group_id().clone();
+                response_ok(
+                    account_request(
+                        &state,
+                        &args.certificate,
+                        delivery_request(
+                            &state,
+                            &recipient,
+                            pigeon_shared::MlsRecord {
+                                recipient: account_identity(recipient.genesis.clone())?,
+                                sender: account_identity(state.card.genesis.clone())?,
+                                sender_device: state.device.device_id,
+                                target_devices: recipient
+                                    .devices
+                                    .iter()
+                                    .map(|device| device.device_id)
+                                    .collect(),
+                                payload: wrap_mls_payload(&state, welcome.to_bytes()?)?,
+                            },
+                        )?,
+                    )
+                    .await?,
+                )?;
+                state
+                    .mls_conversations
+                    .insert(conversation.clone(), id.tls_serialize_detached()?);
+                state
+                    .direct_groups
+                    .insert(hex::encode(id.as_slice()), conversation.clone());
+                for device in &recipient.devices {
+                    state.mls_conversations.insert(
+                        device_mls_key(&recipient.genesis, device.device_id)?,
+                        id.tls_serialize_detached()?,
+                    );
+                }
+                id
+            };
+            let source = std::path::Path::new(&file);
+            let filename = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
+                .context("attachment path must name a regular file")?
+                .to_owned();
+            let bytes = fs::read(source)
+                .with_context(|| format!("read attachment {}", source.display()))?;
+            let mime_type = if filename.to_ascii_lowercase().ends_with(".png") {
+                "image/png"
+            } else if filename.to_ascii_lowercase().ends_with(".jpg")
+                || filename.to_ascii_lowercase().ends_with(".jpeg")
+            {
+                "image/jpeg"
+            } else if filename.to_ascii_lowercase().ends_with(".gif") {
+                "image/gif"
+            } else if filename.to_ascii_lowercase().ends_with(".webp") {
+                "image/webp"
+            } else {
+                "application/octet-stream"
+            }
+            .to_owned();
+            let mut attachment_id = [0; 32];
+            let mut content_key = [0; 32];
+            let mut nonce = [0; 24];
+            OsRng.fill_bytes(&mut attachment_id);
+            OsRng.fill_bytes(&mut content_key);
+            OsRng.fill_bytes(&mut nonce);
+            let encrypted = pigeon_shared::encrypt_attachment(
+                attachment_id,
+                group_id.tls_serialize_detached()?,
+                content_key,
+                nonce,
+                filename.clone(),
+                mime_type,
+                bytes,
+            )?;
+            let local_plaintext = pigeon_shared::decrypt_attachment(
+                &encrypted.descriptor,
+                encrypted.nonce,
+                &encrypted.ciphertext,
+            )?;
+            cache_attachment(
+                &mut state,
+                &args.state,
+                encrypted.descriptor.clone(),
+                local_plaintext,
+            )?;
+            upload_attachment_to_contact(&state, &args.certificate, &recipient, &encrypted).await?;
+            let mut group = MlsGroup::load(provider.storage(), &group_id)?
+                .context("MLS conversation state missing")?;
+            let payload = group
+                .create_message(
+                    &provider,
+                    &signer,
+                    &encode_application(ApplicationContent::Attachment(
+                        encrypted.descriptor.clone(),
+                    ))?,
+                )?
+                .to_bytes()?;
+            response_ok(
+                account_request(
+                    &state,
+                    &args.certificate,
+                    delivery_request(
+                        &state,
+                        &recipient,
+                        pigeon_shared::MlsRecord {
+                            recipient: account_identity(recipient.genesis.clone())?,
+                            sender: account_identity(state.card.genesis.clone())?,
+                            sender_device: state.device.device_id,
+                            target_devices: recipient
+                                .devices
+                                .iter()
+                                .map(|device| device.device_id)
+                                .collect(),
+                            payload: wrap_mls_payload(&state, payload)?,
+                        },
+                    )?,
+                )
+                .await?,
+            )?;
+            persist_mls(&mut state, &provider)?;
+            state.history.push(LocalMessage {
+                conversation,
+                sender: canonical_account_key(&state.card.genesis)?,
+                text: format!("Attachment: {filename}"),
+                timestamp: message_time(),
+                attachment: Some(encrypted.descriptor.clone()),
+            });
+            save(&args.state, &state)?;
+            println!("attachment sent");
+        }
+        Command::GroupAttachment { group, file } => {
+            let mut state = load(&args.state)?;
+            let group_state = state.groups.get(&group).context("unknown group")?.clone();
+            let (provider, signer) = mls_runtime(&state)?;
+            let group_id = GroupId::tls_deserialize_exact(group_state.group_id.clone())?;
+            let source = std::path::Path::new(&file);
+            let filename = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
+                .context("attachment path must name a regular file")?
+                .to_owned();
+            let bytes = fs::read(source)?;
+            let mime_type = if filename.to_ascii_lowercase().ends_with(".png") {
+                "image/png"
+            } else if filename.to_ascii_lowercase().ends_with(".jpg")
+                || filename.to_ascii_lowercase().ends_with(".jpeg")
+            {
+                "image/jpeg"
+            } else if filename.to_ascii_lowercase().ends_with(".gif") {
+                "image/gif"
+            } else if filename.to_ascii_lowercase().ends_with(".webp") {
+                "image/webp"
+            } else {
+                "application/octet-stream"
+            }
+            .to_owned();
+            let mut attachment_id = [0; 32];
+            let mut content_key = [0; 32];
+            let mut nonce = [0; 24];
+            OsRng.fill_bytes(&mut attachment_id);
+            OsRng.fill_bytes(&mut content_key);
+            OsRng.fill_bytes(&mut nonce);
+            let encrypted = pigeon_shared::encrypt_attachment(
+                attachment_id,
+                group_id.tls_serialize_detached()?,
+                content_key,
+                nonce,
+                filename.clone(),
+                mime_type,
+                bytes,
+            )?;
+            let local_plaintext = pigeon_shared::decrypt_attachment(
+                &encrypted.descriptor,
+                encrypted.nonce,
+                &encrypted.ciphertext,
+            )?;
+            cache_attachment(
+                &mut state,
+                &args.state,
+                encrypted.descriptor.clone(),
+                local_plaintext,
+            )?;
+            upload_attachment_to_group(&state, &args.certificate, &group_state.members, &encrypted)
+                .await?;
+            let mut mls_group = MlsGroup::load(provider.storage(), &group_id)?
+                .context("MLS group state missing")?;
+            let payload = mls_group
+                .create_message(
+                    &provider,
+                    &signer,
+                    &encode_application(ApplicationContent::Attachment(
+                        encrypted.descriptor.clone(),
+                    ))?,
+                )?
+                .to_bytes()?;
+            deliver_group_payload(&state, &args.certificate, &group_state.members, payload).await?;
+            persist_mls(&mut state, &provider)?;
+            state.history.push(LocalMessage {
+                conversation: format!("group:{}", hex::encode(mls_group.group_id().as_slice())),
+                sender: canonical_account_key(&state.card.genesis)?,
+                text: format!("Attachment: {filename}"),
+                timestamp: message_time(),
+                attachment: Some(encrypted.descriptor.clone()),
+            });
+            save(&args.state, &state)?;
+            println!("attachment sent");
+        }
+        Command::SaveAttachment {
+            attachment_id,
+            output,
+        } => {
+            let state = load(&args.state)?;
+            let attachment = state
+                .attachments
+                .get(&attachment_id)
+                .context("attachment is not available locally")?;
+            if !attachment.complete {
+                bail!("attachment download is incomplete")
+            }
+            let output = std::path::Path::new(&output);
+            if output.file_name().is_none() {
+                bail!("attachment output must be a file path")
+            }
+            let mut input = fs::File::open(&attachment.local_path)
+                .context("open decrypted attachment cache")?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)
+                .context("refusing to overwrite an existing attachment file")?;
+            std::io::copy(&mut input, &mut output)?;
+            println!("attachment saved");
         }
         Command::GroupCreate { group, members } => {
             let mut state = load(&args.state)?;
@@ -953,6 +1234,7 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 sender: canonical_account_key(&state.card.genesis)?,
                 text,
                 timestamp: message_time(),
+                attachment: None,
             });
             save(&args.state, &state)?;
             println!("sent");
@@ -1561,14 +1843,42 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                                                 .and_then(|contact| contact_key(contact).ok())
                                                 .unwrap_or(key.clone())
                                         };
-                                        let text = String::from_utf8(message.into_bytes())?;
-                                        println!("{}: {}", key, text);
-                                        state.history.push(LocalMessage {
-                                            conversation,
-                                            sender: key,
-                                            text,
-                                            timestamp: message_time(),
-                                        });
+                                        match decode_application(message.into_bytes())? {
+                                            ApplicationContent::Text(text) => {
+                                                println!("{}: {}", key, text);
+                                                state.history.push(LocalMessage {
+                                                    conversation,
+                                                    sender: key,
+                                                    text,
+                                                    timestamp: message_time(),
+                                                    attachment: None,
+                                                });
+                                            }
+                                            ApplicationContent::Attachment(descriptor) => {
+                                                if descriptor.conversation_id
+                                                    != group_id.tls_serialize_detached()?
+                                                {
+                                                    bail!("attachment descriptor is bound to a different MLS conversation")
+                                                }
+                                                let attachment = receive_attachment(
+                                                    &mut state,
+                                                    &args.certificate,
+                                                    &args.state,
+                                                    descriptor.clone(),
+                                                )
+                                                .await?;
+                                                state.history.push(LocalMessage {
+                                                    conversation,
+                                                    sender: key,
+                                                    text: format!(
+                                                        "Attachment: {}",
+                                                        attachment.filename
+                                                    ),
+                                                    timestamp: message_time(),
+                                                    attachment: Some(descriptor),
+                                                });
+                                            }
+                                        }
                                     }
                                     ProcessedMessageContent::StagedCommitMessage(staged) => {
                                         group.merge_staged_commit(&provider, *staged)?;
@@ -1709,4 +2019,96 @@ async fn add_paired_device_to_mls_groups(
         deliver_group_payload(state, certificate, &members, commit.to_bytes()?).await?;
     }
     persist_mls(state, &provider)
+}
+
+async fn receive_attachment(
+    state: &mut State,
+    certificate: &str,
+    state_path: &str,
+    descriptor: AttachmentDescriptor,
+) -> Result<LocalAttachment> {
+    let key = hex::encode(descriptor.attachment_id);
+    if let Some(existing) = state.attachments.get(&key) {
+        if existing.complete && std::path::Path::new(&existing.local_path).is_file() {
+            return Ok(existing.clone());
+        }
+    }
+    let response = account_request(
+        state,
+        certificate,
+        Request::FetchAttachment {
+            account: account_identity(state.card.genesis.clone())?,
+            device_id: state.device.device_id,
+            attachment_id: descriptor.attachment_id,
+        },
+    )
+    .await?;
+    let Response::Attachment(record) = response else {
+        bail!("attachment is not available for this device")
+    };
+    let Some(record) = *record else {
+        bail!("attachment is not available for this device")
+    };
+    if record.attachment_id != descriptor.attachment_id
+        || record.conversation_id != descriptor.conversation_id
+        || record.ciphertext_hash != descriptor.ciphertext_hash
+        || record.plaintext_size != descriptor.plaintext_size
+    {
+        bail!("relay attachment record does not match MLS descriptor")
+    }
+    let plaintext =
+        pigeon_shared::decrypt_attachment(&descriptor, record.nonce, &record.ciphertext)?;
+    let attachment_id = descriptor.attachment_id;
+    let local = cache_attachment(state, state_path, descriptor, plaintext)?;
+    response_ok(
+        account_request(
+            state,
+            certificate,
+            Request::AcknowledgeAttachment {
+                account: account_identity(state.card.genesis.clone())?,
+                device_id: state.device.device_id,
+                attachment_id,
+            },
+        )
+        .await?,
+    )?;
+    Ok(local)
+}
+
+fn cache_attachment(
+    state: &mut State,
+    state_path: &str,
+    descriptor: AttachmentDescriptor,
+    plaintext: pigeon_shared::AttachmentPlaintext,
+) -> Result<LocalAttachment> {
+    let key = hex::encode(descriptor.attachment_id);
+    // Cache bytes below a directory derived from this exact account state
+    // path. A multi-account profile may keep several state files under one
+    // parent directory; random attachment IDs are not an authorization
+    // boundary and must not make their plaintext caches shared.
+    let state_scope = Sha256::digest(state_path.as_bytes());
+    let root = std::path::Path::new(state_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("attachments")
+        .join(hex::encode(state_scope));
+    fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let local_path = root.join(&key);
+    fs::write(&local_path, &plaintext.bytes)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &local_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    let local = LocalAttachment {
+        descriptor,
+        filename: plaintext.filename,
+        mime_type: plaintext.mime_type,
+        local_path: local_path.to_string_lossy().into_owned(),
+        complete: true,
+    };
+    state.attachments.insert(key, local.clone());
+    Ok(local)
 }

@@ -86,6 +86,7 @@ The client core should remain independent of Tauri so communication, identity, c
 - [Devices, groups, relay, and first milestone](docs/architecture/0003-devices-groups-relay-and-first-milestone.md)
 - [Secure add-device authorization and bootstrap](docs/architecture/0005-secure-add-device-bootstrap.md)
 - [Immutable account genesis and recovery-gated authority](docs/architecture/0006-account-genesis-and-recovery-authority.md)
+- [Encrypted attachment delivery](docs/architecture/0007-encrypted-attachments.md)
 
 ## Status
 

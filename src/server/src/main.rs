@@ -91,8 +91,8 @@ const RETENTION_SECONDS: i64 = 14 * 24 * 60 * 60;
 
 mod runtime;
 use runtime::{
-    bind_relay_tls_spki, descriptor, flush_network_outbound, handle, initialize,
-    maintain_lifecycle, set_relay_address, system_now,
+    bind_relay_tls_spki, descriptor, flush_network_attachment_outbound, flush_network_outbound,
+    handle, initialize, maintain_lifecycle, set_relay_address, system_now,
 };
 
 #[tokio::main]
@@ -147,6 +147,10 @@ async fn main() -> Result<()> {
                 // The row deliberately remains durable for retry after a peer
                 // outage, restart, or corrected route/TLS endpoint.
                 eprintln!("relay forwarding deferred: {error:#}");
+            }
+            if let Err(error) = flush_network_attachment_outbound(forwarding_database.clone()).await
+            {
+                eprintln!("attachment relay forwarding deferred: {error:#}");
             }
         }
     });

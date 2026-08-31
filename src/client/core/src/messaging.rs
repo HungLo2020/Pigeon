@@ -1,6 +1,6 @@
 //! MLS transport framing that remains opaque to relays.
 
-use super::{ContactCard, Context, Result, RoutingRecord, State};
+use super::{AttachmentDescriptor, ContactCard, Context, Result, RoutingRecord, State};
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,34 @@ struct DiscoveryEnvelope {
     sender_route: RoutingRecord,
 }
 type DiscoveryMetadata = (ContactCard, RoutingRecord);
+
+/// Versioned MLS application content. Older peers emitted UTF-8 text directly;
+/// decoding deliberately retains that strictly local compatibility while all
+/// new attachment metadata remains inside MLS encryption.
+const APPLICATION_CONTENT_VERSION: u8 = 1;
+#[derive(Serialize, Deserialize)]
+pub(super) enum ApplicationContent {
+    Text(String),
+    Attachment(AttachmentDescriptor),
+}
+
+pub(super) fn encode_application(content: ApplicationContent) -> Result<Vec<u8>> {
+    let mut bytes = b"PIGEONAPP".to_vec();
+    bytes.push(APPLICATION_CONTENT_VERSION);
+    bytes.extend(bincode::serialize(&content)?);
+    Ok(bytes)
+}
+
+pub(super) fn decode_application(bytes: Vec<u8>) -> Result<ApplicationContent> {
+    const MAGIC: &[u8] = b"PIGEONAPP";
+    if !bytes.starts_with(MAGIC) {
+        return Ok(ApplicationContent::Text(String::from_utf8(bytes)?));
+    }
+    if bytes.get(MAGIC.len()).copied() != Some(APPLICATION_CONTENT_VERSION) {
+        bail!("unsupported MLS application content version")
+    }
+    Ok(bincode::deserialize(&bytes[MAGIC.len() + 1..])?)
+}
 
 pub(super) fn wrap_mls_payload(state: &State, mls_payload: Vec<u8>) -> Result<Vec<u8>> {
     let sender_route = state

@@ -190,7 +190,10 @@ fn permitted_core_command(arguments: &[String]) -> bool {
                 | "set-nickname"
                 | "fetch"
                 | "send"
+                | "send-attachment"
                 | "group-send"
+                | "group-attachment"
+                | "save-attachment"
                 | "add-contact"
                 | "card"
                 | "mark-read"
@@ -474,6 +477,9 @@ mod tests {
     #[test]
     fn allowed_commands_are_closed() {
         assert!(permitted_core_command(&["fetch".into()]));
+        assert!(permitted_core_command(&["send-attachment".into()]));
+        assert!(permitted_core_command(&["group-attachment".into()]));
+        assert!(permitted_core_command(&["save-attachment".into()]));
         assert!(!permitted_core_command(&["shell".into()]));
     }
     #[test]

@@ -43,6 +43,11 @@ The server may be authoritative for recent delivery, synchronization, observed a
 
 Server addresses are mutable routing metadata. A user moving to another server remains the same cryptographic identity.
 
+Attachment ciphertext is stored separately from MLS event bytes but follows
+the same active-device ACK-or-14-day maximum lifecycle. Relay rows contain
+only opaque ciphertext, hashes, canonical account selectors, and delivery
+metadata; filenames, MIME types, and keys remain MLS-protected.
+
 Relay account rows are keyed by the complete canonical `PigeonAccountGenesis`.
 The SHA-256 compact account ID is a non-unique index only; two distinct
 genesis records with the same compact ID coexist without sharing devices,
