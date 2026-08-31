@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "identifier": "org.pigeon.chat",
   "build": { "frontendDist": "../frontend/dist", "devUrl": "http://localhost:1420", "beforeDevCommand": "npm --prefix frontend run dev -- --port 1420", "beforeBuildCommand": "npm --prefix frontend run build" },
-  "app": { "windows": [{ "title": "Pigeon", "width": 1100, "height": 760, "minWidth": 360, "minHeight": 600 }], "security": { "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline';" } },
-  "bundle": { "active": true, "targets": "all", "icon": ["../../../resources/pigeon.svg"] }
+  "app": { "windows": [{ "title": "Pigeon", "width": 1100, "height": 760, "minWidth": 360, "minHeight": 600, "decorations": true }], "security": { "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline';" } },
+  "bundle": { "active": true, "targets": "all", "icon": ["../../../resources/pigeon.svg"], "linux": { "deb": { "desktopTemplate": "../../../packaging/debian/pigeon-client.desktop" } } }
 }

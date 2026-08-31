@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Pigeon
+Comment=Private, end-to-end encrypted Pigeon messaging
+Exec={{exec}}
+StartupWMClass=org.pigeon.chat
+Icon=org.pigeon.chat
+Categories=Network;InstantMessaging;
+StartupNotify=true
+Terminal=false
+Type=Application

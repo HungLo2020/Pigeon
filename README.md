@@ -104,6 +104,12 @@ and is validated to exclude Tauri, WebKit, and frontend assets. Both packages
 share one workspace version and source commit, but can be built independently
 through `DevUtils/build_debian_packages.py --client` or `--server`.
 
+The client package installs the desktop entry as `org.pigeon.chat.desktop`,
+matching the Tauri application identifier, and includes the matching hicolor
+icon. This lets COSMIC and other Linux desktops associate the launcher with
+the native decorated Wayland window instead of falling back to generic
+executable-name metadata.
+
 Installing `pigeon-server` creates a non-login `pigeon` account and the
 `pigeon-server` systemd unit, but does not enable it. Run `sudo pigeon-setup`
 to choose the listener/public address and TLS material, initialize persistent

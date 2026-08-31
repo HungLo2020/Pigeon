@@ -26,6 +26,7 @@ TAURI_CONFIG = ROOT / "src/client/tauri/tauri.conf.json"
 CLIENT_MANIFEST = ROOT / "src/client/tauri/Cargo.toml"
 SERVER_MANIFEST = ROOT / "src/server/Cargo.toml"
 DEBIAN_PACKAGING = ROOT / "packaging/debian"
+CLIENT_DESKTOP_ID = "org.pigeon.chat"
 
 
 def run(*command: str, cwd: Path = ROOT) -> None:
@@ -108,9 +109,23 @@ def build_client(output: Path, version: str, arch: str) -> Path:
         daemon_dir = staging / "usr/bin"
         core_dir = staging / "usr/lib/pigeon"
         unit_dir = staging / "usr/lib/systemd/user"
+        applications_dir = staging / "usr/share/applications"
+        icon_dir = staging / "usr/share/icons/hicolor/scalable/apps"
         daemon_dir.mkdir(parents=True, exist_ok=True)
         core_dir.mkdir(parents=True, exist_ok=True)
         unit_dir.mkdir(parents=True, exist_ok=True)
+        generated_desktop = applications_dir / "Pigeon.desktop"
+        canonical_desktop = applications_dir / f"{CLIENT_DESKTOP_ID}.desktop"
+        if not generated_desktop.is_file():
+            raise RuntimeError("Tauri Debian bundle did not contain its desktop entry")
+        # Tauri derives a desktop-file name from productName.  Linux desktops
+        # identify this Wayland app by its reverse-DNS application ID, so keep
+        # launcher, icon, and native window metadata aligned after bundling.
+        generated_desktop.replace(canonical_desktop)
+        icon_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "resources/pigeon.svg", icon_dir / f"{CLIENT_DESKTOP_ID}.svg")
+        canonical_desktop.chmod(0o644)
+        (icon_dir / f"{CLIENT_DESKTOP_ID}.svg").chmod(0o644)
         shutil.copy2(ROOT / "target/release/pigeon-client-daemon", daemon_dir / "pigeon-client-daemon")
         shutil.copy2(ROOT / "target/release/pigeon-client", core_dir / "pigeon-client-core")
         (daemon_dir / "pigeon-client-daemon").chmod(0o755)
@@ -236,7 +251,14 @@ def validate(client: Path | None, server: Path | None) -> None:
         control = package_control(client)
         listing = package_listing(client)
         scripts = control_members(client)
-        required = ("./usr/bin/pigeon-tauri", "./usr/bin/pigeon-client-daemon", "./usr/lib/pigeon/pigeon-client-core", "./usr/lib/systemd/user/pigeon-client-daemon.service")
+        required = (
+            "./usr/bin/pigeon-tauri",
+            "./usr/bin/pigeon-client-daemon",
+            "./usr/lib/pigeon/pigeon-client-core",
+            "./usr/lib/systemd/user/pigeon-client-daemon.service",
+            "./usr/share/applications/org.pigeon.chat.desktop",
+            "./usr/share/icons/hicolor/scalable/apps/org.pigeon.chat.svg",
+        )
         if "Package: pigeon-client" not in control or any(value not in listing for value in required) or "postinst" not in scripts:
             raise RuntimeError("pigeon-client package does not contain the expected Tauri application")
         archive = subprocess.check_output(["dpkg-deb", "--ctrl-tarfile", str(client)])

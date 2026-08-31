@@ -112,6 +112,7 @@ def main() -> int:
     core_binary = ROOT / "target" / profile / "pigeon-client"
     daemon_binary = ROOT / "target" / profile / "pigeon-client-daemon"
     environment = os.environ.copy()
+    profile_runtime: Path | None = None
     if args.profile:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args.profile):
             print("RunClient.py: profile may contain only letters, digits, '_' and '-'.", file=sys.stderr)
@@ -123,13 +124,15 @@ def main() -> int:
         profile_runtime.mkdir(parents=True, exist_ok=True)
         profile_runtime.chmod(0o700)
         environment["XDG_DATA_HOME"] = str(profile_data)
-        environment["XDG_RUNTIME_DIR"] = str(profile_runtime)
         environment["PIGEON_DATA_DIR"] = str(profile_data / "pigeon")
     environment["PIGEON_CLIENT_BIN"] = str(core_binary)
     environment["PIGEON_CLIENT_DAEMON_BIN"] = str(daemon_binary)
     data_home = Path(environment.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
     data_dir = Path(environment.get("PIGEON_DATA_DIR", str(data_home / "pigeon")))
-    runtime_dir = Path(environment.get("XDG_RUNTIME_DIR", "/tmp"))
+    # Do not replace XDG_RUNTIME_DIR for a profile: GTK uses the session value
+    # to find the Wayland socket.  Only Pigeon's private daemon socket needs
+    # isolation, so place that one below the profile runtime directory.
+    runtime_dir = profile_runtime or Path(environment.get("XDG_RUNTIME_DIR", "/tmp"))
     daemon_socket = runtime_dir / "pigeon" / "pigeon-client.sock"
     environment["PIGEON_DAEMON_SOCKET"] = str(daemon_socket)
     certificate = args.certificate or (LOCAL_RELAY_CERTIFICATE if LOCAL_RELAY_CERTIFICATE.exists() else None)
