@@ -87,6 +87,16 @@ struct AttachmentSummary {
     complete: bool,
     state: String,
 }
+
+fn image_preview_bytes_match_mime(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
 #[derive(Serialize, Clone)]
 struct AccountStatus {
     state_exists: bool,
@@ -881,6 +891,9 @@ fn attachment_preview(app: tauri::AppHandle, attachment_id: String) -> Result<St
         return Err("image is too large for an inline preview; save it to view it".into());
     }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if !image_preview_bytes_match_mime(mime, &bytes) {
+        return Err("attachment bytes do not match their supported image MIME type".into());
+    }
     Ok(format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -1047,6 +1060,23 @@ mod tests {
             },
         ];
         assert_eq!(unread_count(&messages, Some("alice"), "bob", 10), 1);
+    }
+
+    #[test]
+    fn previews_require_a_supported_matching_image_signature() {
+        assert!(image_preview_bytes_match_mime(
+            "image/png",
+            b"\x89PNG\r\n\x1a\nvalidated"
+        ));
+        assert!(!image_preview_bytes_match_mime("image/png", b"<svg></svg>"));
+        assert!(!image_preview_bytes_match_mime(
+            "image/svg+xml",
+            b"<svg></svg>"
+        ));
+        assert!(!image_preview_bytes_match_mime(
+            "image/webp",
+            b"RIFFbad!NOPE"
+        ));
     }
 
     #[test]

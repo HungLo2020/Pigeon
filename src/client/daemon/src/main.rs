@@ -191,8 +191,11 @@ fn permitted_core_command(arguments: &[String]) -> bool {
                 | "fetch"
                 | "send"
                 | "send-attachment"
+                | "group-create"
                 | "group-send"
                 | "group-attachment"
+                | "group-add"
+                | "group-remove"
                 | "save-attachment"
                 | "add-contact"
                 | "card"
@@ -478,7 +481,10 @@ mod tests {
     fn allowed_commands_are_closed() {
         assert!(permitted_core_command(&["fetch".into()]));
         assert!(permitted_core_command(&["send-attachment".into()]));
+        assert!(permitted_core_command(&["group-create".into()]));
         assert!(permitted_core_command(&["group-attachment".into()]));
+        assert!(permitted_core_command(&["group-add".into()]));
+        assert!(permitted_core_command(&["group-remove".into()]));
         assert!(permitted_core_command(&["save-attachment".into()]));
         assert!(!permitted_core_command(&["shell".into()]));
     }

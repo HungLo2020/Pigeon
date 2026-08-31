@@ -982,12 +982,43 @@ fn signed_revocation_removes_pending_delivery_and_survives_relay_restart() {
         ),
         Response::Ok
     ));
+    let attachment = AttachmentRecord {
+        version: pigeon_shared::ATTACHMENT_VERSION,
+        recipient: account_for(&card),
+        sender: account_for(&card),
+        sender_device: [7; 32],
+        target_devices: vec![a2_record.device_id],
+        attachment_id: [42; 32],
+        conversation_id: b"revocation-group".to_vec(),
+        plaintext_size: 3,
+        ciphertext_hash: Sha256::digest([1, 2, 3]).into(),
+        nonce: [4; 24],
+        ciphertext: vec![1, 2, 3],
+    };
+    assert!(matches!(
+        process(&database, Request::SendAttachment(attachment)),
+        Response::Ok
+    ));
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM attachments_v1", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     let revocation = make_revocation(&root, a2_record.device_id, 1);
     assert!(pigeon_shared::verify_revocation(&revocation).is_ok());
     assert!(matches!(
         process(&database, Request::RevokeDevice(revocation.clone())),
         Response::Ok
     ));
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM attachments_v1", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     assert!(matches!(
         process(
             &database,

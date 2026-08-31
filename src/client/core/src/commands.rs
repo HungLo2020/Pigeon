@@ -721,14 +721,9 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
             let mut state = load(&args.state)?;
             let card = parse_card(&card)?;
             let contact_identity = identity_id(&card);
-            if let Ok(Response::Routing(Some(route))) = request(
-                &card.server,
-                &args.certificate,
-                Request::GetRouting {
-                    account: account_identity(card.genesis.clone())?,
-                },
-            )
-            .await
+            if let Ok(route) =
+                bootstrap_contact_routing(&card.server, account_identity(card.genesis.clone())?)
+                    .await
             {
                 validate_route_descriptor(&route, &pinned_relay_descriptor(&route).await?)?;
                 // The signed route is independently verified.  A freshly
@@ -745,8 +740,11 @@ pub(super) async fn dispatch(args: Args) -> Result<()> {
                 .any(|existing| existing.genesis == card.genesis)
             {
                 state.contacts.push(card);
-                save(&args.state, &state)?;
             }
+            // A duplicate import is a normal way to refresh a contact's
+            // verified routing record; persist that cache update even when
+            // the immutable contact card itself was already present.
+            save(&args.state, &state)?;
             println!("contact added");
         }
         Command::Send { to, text } => {
@@ -2087,11 +2085,17 @@ fn cache_attachment(
     // parent directory; random attachment IDs are not an authorization
     // boundary and must not make their plaintext caches shared.
     let state_scope = Sha256::digest(state_path.as_bytes());
-    let root = std::path::Path::new(state_path)
+    let cache_parent = std::path::Path::new(state_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("attachments")
-        .join(hex::encode(state_scope));
+        .join("attachments");
+    fs::create_dir_all(&cache_parent)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &cache_parent,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let root = cache_parent.join(hex::encode(state_scope));
     fs::create_dir_all(&root)?;
     #[cfg(unix)]
     fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;

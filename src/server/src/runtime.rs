@@ -439,6 +439,23 @@ fn process_at(connection: &Connection, request: Request, now: i64) -> Response {
                     "DELETE FROM event_deliveries_v2 WHERE recipient_genesis = ?1 AND device_id = ?2 AND acknowledged = 0",
                     params![genesis.clone(), revocation.device_id.to_vec()],
                 )?;
+                // A revoked device must not retain a fetchable attachment
+                // handle while awaiting a later maintenance tick. Remove its
+                // delivery rows in this same authorization transaction, then
+                // reclaim any ciphertext that no remaining active device
+                // needs.
+                transaction.execute(
+                    "DELETE FROM attachment_deliveries_v1 WHERE recipient_genesis = ?1 AND device_id = ?2 AND acknowledged = 0",
+                    params![genesis.clone(), revocation.device_id.to_vec()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM attachment_deliveries_v1 WHERE (recipient_genesis, attachment_id) IN (SELECT a.recipient_genesis, a.attachment_id FROM attachments_v1 a WHERE NOT EXISTS (SELECT 1 FROM attachment_deliveries_v1 d WHERE d.recipient_genesis = a.recipient_genesis AND d.attachment_id = a.attachment_id AND d.acknowledged = 0))",
+                    [],
+                )?;
+                transaction.execute(
+                    "DELETE FROM attachments_v1 WHERE NOT EXISTS (SELECT 1 FROM attachment_deliveries_v1 d WHERE d.recipient_genesis = attachments_v1.recipient_genesis AND d.attachment_id = attachments_v1.attachment_id AND d.acknowledged = 0)",
+                    [],
+                )?;
                 transaction.execute("DELETE FROM event_deliveries_v2 WHERE event_id IN (SELECT e.id FROM mls_events_v2 e WHERE NOT EXISTS (SELECT 1 FROM event_deliveries_v2 d WHERE d.event_id = e.id AND d.acknowledged = 0))", [])?;
                 transaction.execute("DELETE FROM mls_events_v2 WHERE id IN (SELECT e.id FROM mls_events_v2 e WHERE NOT EXISTS (SELECT 1 FROM event_deliveries_v2 d WHERE d.event_id = e.id AND d.acknowledged = 0))", [])?;
                 transaction.commit()?;

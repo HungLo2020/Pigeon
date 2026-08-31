@@ -393,7 +393,10 @@ fn clients_exchange_mls_through_pinned_relays_and_follow_moved_after_restart() {
             "--state".into(),
             alice.display().to_string(),
             "--certificate".into(),
-            directory.join("b.der").display().to_string(),
+            // A GUI/daemon owns only Alice's local certificate. Importing a
+            // remote signed card must bootstrap and pin Bob's signed route;
+            // it must not require Bob's private development certificate.
+            directory.join("a.der").display().to_string(),
             "add-contact".into(),
             bob_card,
         ],

@@ -704,6 +704,33 @@ async fn direct_relay_descriptor(server: &str) -> Result<RelayDescriptor> {
     Ok(descriptor)
 }
 
+/// Bootstrap a *public* signed routing record for a contact card. TLS is
+/// deliberately not trusted for this one request: the returned record is
+/// accepted only after its root signature, immutable genesis, compact lookup
+/// value, and minimum card revision are checked by the caller, followed by a
+/// second connection pinned to the route's signed SPKI. This is the same
+/// constrained first-contact model as direct relay discovery; it never
+/// authorizes ordinary account, MLS, or attachment traffic.
+async fn bootstrap_contact_routing(
+    server: &str,
+    account: pigeon_shared::AccountIdentity,
+) -> Result<RoutingRecord> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DiscoveryVerifier))
+        .with_no_client_auth();
+    let stream = TcpStream::connect(server).await?;
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost")?.to_owned(), stream)
+        .await?;
+    write_frame(&mut tls, &encode(&Request::GetRouting { account })?).await?;
+    let Response::Routing(Some(route)) = decode(&read_frame(&mut tls).await?)? else {
+        bail!("contact relay did not provide a current signed routing record")
+    };
+    pigeon_shared::verify_routing(&route)?;
+    Ok(route)
+}
+
 async fn https_relay_descriptor(input: &str) -> Result<RelayDescriptor> {
     let url = if input.starts_with("https://") {
         Url::parse(input)?
