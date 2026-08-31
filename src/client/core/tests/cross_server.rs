@@ -12,7 +12,10 @@ fn relay_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("relay test lock")
+        // A prior assertion must not turn independent relay tests into
+        // misleading poison failures; the guard still serializes all relay
+        // processes and each test reports its own concrete failure.
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn run(binary: &Path, arguments: &[String]) -> String {
@@ -47,7 +50,10 @@ fn server(binary: &Path, address: &str, directory: &Path, name: &str) -> Child {
 }
 
 fn wait_for(path: &Path) {
-    for _ in 0..100 {
+    // Fresh bundled-SQLite relay startup can exceed 2.5 seconds on a loaded
+    // hosted CI runner. Keep the test deterministic without masking an exited
+    // process (checked on every iteration).
+    for _ in 0..400 {
         if path.exists() {
             return;
         }
