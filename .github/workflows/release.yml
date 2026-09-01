@@ -122,3 +122,15 @@ jobs:
             release-assets/pigeon-client_*.deb \
             release-assets/pigeon-server_*.deb \
             release-assets/SHA256SUMS
+          # Explicitly publish the release. This guards against GitHub CLI or
+          # repository-policy behavior that leaves a newly-created release as
+          # a draft, which public installer discovery correctly cannot see.
+          gh release edit latest --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest")"
+          test "$(jq -r '.draft' <<<"$RELEASE_JSON")" = false
+          test "$(jq -r '.target_commitish' <<<"$RELEASE_JSON")" = "$SOURCE_SHA"
+          jq -e --arg client "pigeon-client" --arg server "pigeon-server" '
+            ([.assets[].name] | any(startswith($client) and endswith(".deb"))) and
+            ([.assets[].name] | any(startswith($server) and endswith(".deb"))) and
+            ([.assets[].name] | any(. == "SHA256SUMS"))
+          ' <<<"$RELEASE_JSON" >/dev/null

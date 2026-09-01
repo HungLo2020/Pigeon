@@ -19,7 +19,10 @@ from urllib.request import Request, urlopen
 
 
 REPOSITORY = "HungLo2020/Pigeon"
-RELEASE_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/tags/latest"
+# GitHub exposes only published releases from this endpoint.  That is exactly
+# the installer contract: a draft (including an accidentally-created rolling
+# draft) must never be treated as installable public release metadata.
+RELEASE_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 USER_AGENT = "pigeon-latest-installer/1"
 
 
