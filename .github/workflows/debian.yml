@@ -75,6 +75,7 @@ jobs:
       - name: Upload Debian package artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: pigeon-debian
           path: release/
           if-no-files-found: error
